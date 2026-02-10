@@ -1,5 +1,5 @@
 use datacave_core::types::{Column, DataValue};
-use sqlparser::ast::{Expr, ObjectName, Statement, Value};
+use sqlparser::ast::{Expr, ObjectName, Statement, TableConstraint, TableFactor, Value, FromTable, TableWithJoins};
 
 #[derive(Debug, Clone)]
 pub enum Plan {
@@ -57,9 +57,9 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
                 })
                 .collect();
             let primary_key = constraints.iter().find_map(|c| match c {
-                sqlparser::ast::TableConstraint::Unique {
-                    is_primary, columns, ..
-                } if *is_primary => columns.first().map(|c| c.value.clone()),
+                TableConstraint::PrimaryKey { columns, .. } => {
+                    columns.first().map(|c| c.value.clone())
+                }
                 _ => None,
             });
             Some(Plan::CreateTable(CreateTablePlan {
@@ -72,13 +72,15 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
             let table = object_name(table_name);
             let cols = columns.iter().map(|c| c.value.clone()).collect();
             let mut values = Vec::new();
-            if let sqlparser::ast::SetExpr::Values(v) = &source.body {
-                for row in &v.rows {
-                    let mut parsed = Vec::new();
-                    for expr in row {
-                        parsed.push(expr_to_value(expr));
+            if let Some(source) = source {
+                if let sqlparser::ast::SetExpr::Values(v) = &*source.body {
+                    for row in &v.rows {
+                        let mut parsed = Vec::new();
+                        for expr in row {
+                            parsed.push(expr_to_value(expr));
+                        }
+                        values.push(parsed);
                     }
-                    values.push(parsed);
                 }
             }
             Some(Plan::Insert(InsertPlan {
@@ -88,10 +90,10 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
             }))
         }
         Statement::Query(query) => {
-            if let sqlparser::ast::SetExpr::Select(select) = &query.body {
+            if let sqlparser::ast::SetExpr::Select(select) = &*query.body {
                 let table = match select.from.first() {
                     Some(rel) => match &rel.relation {
-                        sqlparser::ast::TableFactor::Table { name, .. } => object_name(name),
+                        TableFactor::Table { name, .. } => object_name(name),
                         _ => return None,
                     },
                     None => return None,
@@ -107,21 +109,26 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
         }
         Statement::Update { table, assignments, .. } => {
             let table = match &table.relation {
-                sqlparser::ast::TableFactor::Table { name, .. } => object_name(name),
+                TableFactor::Table { name, .. } => object_name(name),
                 _ => return None,
             };
             let assigns = assignments
                 .iter()
-                .map(|a| (a.id.value.clone(), expr_to_value(&a.value)))
+                .filter_map(|a| a.id.first().map(|ident| (ident.value.clone(), expr_to_value(&a.value))))
                 .collect();
             Some(Plan::Update(UpdatePlan {
                 table,
                 assignments: assigns,
             }))
         }
-        Statement::Delete { table_name, .. } => Some(Plan::Delete(DeletePlan {
-            table: object_name(table_name),
-        })),
+        Statement::Delete { from, .. } => {
+            let table = first_from_table(from)
+                .and_then(|relation| match &relation.relation {
+                    TableFactor::Table { name, .. } => Some(object_name(name)),
+                    _ => None,
+                })?;
+            Some(Plan::Delete(DeletePlan { table }))
+        }
         _ => None,
     }
 }
@@ -132,6 +139,13 @@ fn object_name(name: &ObjectName) -> String {
         .map(|ident| ident.value.clone())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn first_from_table(from: &FromTable) -> Option<&TableWithJoins> {
+    match from {
+        FromTable::WithFromKeyword(relations) => relations.first(),
+        FromTable::WithoutKeyword(relations) => relations.first(),
+    }
 }
 
 fn expr_to_value(expr: &Expr) -> DataValue {

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
+use tokio::time::{interval, timeout, Duration};
 use tracing::{error, info};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use metrics::counter;
@@ -27,11 +28,17 @@ use std::fs::File;
 use std::io::BufReader;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use rustls;
+use tokio_rustls::rustls;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use uuid::Uuid;
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let metrics_handle = PrometheusBuilder::new().install_recorder()?;
-    let metrics_addr = config.metrics.listen_addr.clone();
+    let metrics_addr: std::net::SocketAddr = config
+        .metrics
+        .listen_addr
+        .parse()
+        .unwrap_or(([127, 0, 0, 1], 9898).into());
     tokio::spawn(async move {
         let app = axum::Router::new()
             .route(
@@ -40,9 +47,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             )
             .route("/health", axum::routing::get(|| async { "ok" }))
             .route("/ready", axum::routing::get(|| async { "ok" }));
-        let _ = axum::Server::bind(&metrics_addr.parse().unwrap_or(([127, 0, 0, 1], 9898).into()))
-            .serve(app.into_make_service())
-            .await;
+        if let Ok(listener) = tokio::net::TcpListener::bind(metrics_addr).await {
+            let _ = axum::serve(listener, app).await;
+        }
     });
 
     let listener = TcpListener::bind(&config.server.listen_addr).await?;
@@ -50,6 +57,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let router = ShardRouter::new(&config).await?;
     let connection_limit = Arc::new(Semaphore::new(config.server.max_connections));
+    let idle_timeout = config.server.idle_timeout_secs.map(Duration::from_secs);
     let auth = if config.security.auth.enabled {
         Some(Arc::new(AuthManager::new(&config.security.auth)?))
     } else {
@@ -57,7 +65,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
     let tls_acceptor = build_tls_acceptor(&config).ok();
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let (socket, _) = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("shutdown requested");
+                break;
+            }
+            result = listener.accept() => result?,
+        };
         let router = router.clone();
         let permit = match connection_limit.clone().acquire_owned().await {
             Ok(permit) => permit,
@@ -65,22 +79,24 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         };
         let auth = auth.clone();
         let tls_acceptor = tls_acceptor.clone();
+        let idle_timeout = idle_timeout;
         tokio::spawn(async move {
             let _permit = permit;
             if let Some(acceptor) = tls_acceptor {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
-                        handle_client(tls_stream, router, auth).await;
+                        handle_client(tls_stream, router, auth, idle_timeout).await;
                     }
                     Err(err) => {
                         error!("tls accept error: {err}");
                     }
                 }
             } else {
-                handle_client(socket, router, auth).await;
+                handle_client(socket, router, auth, idle_timeout).await;
             }
         });
     }
+    Ok(())
 }
 
 async fn handle_query(
@@ -185,8 +201,9 @@ impl ShardRouter {
                     wal_enabled: config.storage.wal_enabled,
                 };
                 let (tx, rx) = mpsc::channel(128);
+                let compaction_interval = config.storage.compaction_interval_secs;
                 let shard = Shard::new(options).await?;
-                shard.start(rx);
+                shard.start(rx, compaction_interval);
                 let node_id = format!("shard-{}-replica-{}", shard_id, replica_id);
                 failover.mark_healthy(&node_id);
                 replicas.push(ShardReplica {
@@ -307,6 +324,7 @@ impl ShardReplica {
 
 struct Shard {
     executor: Arc<SqlExecutor>,
+    storage: Arc<LsmEngine>,
 }
 
 impl Shard {
@@ -315,12 +333,24 @@ impl Shard {
         let storage = Arc::new(LsmEngine::open(options).await?);
         let catalog = Arc::new(Mutex::new(Catalog::new()));
         let mvcc = Arc::new(MvccManager::new());
-        let executor = Arc::new(SqlExecutor::new(catalog, mvcc, storage));
-        Ok(Self { executor })
+        let executor = Arc::new(SqlExecutor::new(catalog, mvcc, storage.clone()));
+        Ok(Self { executor, storage })
     }
 
-    fn start(self, mut rx: mpsc::Receiver<ShardRequest>) {
+    fn start(self, mut rx: mpsc::Receiver<ShardRequest>, compaction_interval: Option<u64>) {
         let executor = self.executor.clone();
+        if let Some(secs) = compaction_interval {
+            let storage = self.storage.clone();
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_secs(secs));
+                loop {
+                    ticker.tick().await;
+                    if let Err(err) = storage.compact().await {
+                        error!("compaction error: {err}");
+                    }
+                }
+            });
+        }
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let result = executor.execute(&req.stmt, req.tenant_id.as_deref()).await;
@@ -380,7 +410,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     router: ShardRouter,
     auth: Option<Arc<AuthManager>>,
+    idle_timeout: Option<Duration>,
 ) {
+    let connection_id = Uuid::new_v4().to_string();
     let startup = match read_startup(&mut stream).await {
         Ok(msg) => msg,
         Err(err) => {
@@ -455,8 +487,26 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     .await;
     let _ = write_message(&mut stream, BackendMessage::ReadyForQuery).await;
 
+    info!("connection started {}", connection_id);
     loop {
-        let msg = match read_message(&mut stream).await {
+        let msg = match idle_timeout {
+            Some(timeout_duration) => match timeout(timeout_duration, read_message(&mut stream)).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = write_message(
+                        &mut stream,
+                        BackendMessage::ErrorResponse {
+                            message: "idle timeout".into(),
+                        },
+                    )
+                    .await;
+                    break;
+                }
+            },
+            None => read_message(&mut stream).await,
+        };
+        let msg = match msg {
             Ok(m) => m,
             Err(err) => {
                 error!("read error: {err}");
@@ -465,6 +515,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         };
         match msg {
             FrontendMessage::Query { sql } => {
+                let span = tracing::info_span!("query", connection_id = connection_id.as_str());
+                let _enter = span.enter();
                 let result = handle_query(&router, &sql, tenant_id.clone(), user_ctx.as_ref()).await;
                 match result {
                     Ok(result) => {
@@ -498,6 +550,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             _ => {}
         }
     }
+    info!("connection closed {}", connection_id);
 }
 
 fn build_tls_acceptor(config: &Config) -> anyhow::Result<TlsAcceptor> {
@@ -518,17 +571,15 @@ fn build_tls_acceptor(config: &Config) -> anyhow::Result<TlsAcceptor> {
         .ok_or_else(|| anyhow::anyhow!("missing tls key_path"))?;
     let cert_file = &mut BufReader::new(File::open(cert_path)?);
     let key_file = &mut BufReader::new(File::open(key_path)?);
-    let cert_chain = certs(cert_file)?
-        .into_iter()
-        .map(rustls::Certificate)
-        .collect();
-    let mut keys = pkcs8_private_keys(key_file)?;
+    let cert_chain: Vec<CertificateDer<'static>> =
+        certs(cert_file).collect::<Result<_, _>>()?;
+    let mut keys: Vec<rustls::pki_types::PrivatePkcs8KeyDer<'static>> =
+        pkcs8_private_keys(key_file).collect::<Result<_, _>>()?;
     if keys.is_empty() {
         return Err(anyhow::anyhow!("no private keys found"));
     }
-    let key = rustls::PrivateKey(keys.remove(0));
+    let key = PrivateKeyDer::from(keys.remove(0));
     let config = rustls::ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
@@ -545,6 +596,7 @@ mod tests {
             server: ServerConfig {
                 listen_addr: "127.0.0.1:0".into(),
                 max_connections: 8,
+                idle_timeout_secs: None,
             },
             storage: StorageConfig {
                 data_dir: data_dir.into(),
@@ -553,6 +605,7 @@ mod tests {
                 sstable_target_bytes: 1024,
                 encryption_enabled: false,
                 encryption_key_base64: None,
+                compaction_interval_secs: None,
             },
             sharding: ShardingConfig { shard_count: 1 },
             cluster: ClusterConfig {
@@ -597,7 +650,7 @@ mod tests {
         let router = ShardRouter::new(&config).await.expect("router");
         let (mut client, server) = tokio::io::duplex(2048);
         tokio::spawn(async move {
-            handle_client(server, router, None).await;
+            handle_client(server, router, None, None).await;
         });
 
         let params = b"user\0test\0\0";
@@ -611,6 +664,8 @@ mod tests {
 
         let auth_type = read_message_type(&mut client).await;
         assert_eq!(auth_type, b'R');
+        let param_type = read_message_type(&mut client).await;
+        assert_eq!(param_type, b'S');
         let ready_type = read_message_type(&mut client).await;
         assert_eq!(ready_type, b'Z');
 

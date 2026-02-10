@@ -1,6 +1,7 @@
 [server]
 listen_addr = "127.0.0.1:5433"
 max_connections = 1024
+idle_timeout_secs = 300
 
 [storage]
 data_dir = "./data"
@@ -9,6 +10,7 @@ memtable_max_bytes = 67108864
 sstable_target_bytes = 134217728
 encryption_enabled = false
 encryption_key_base64 = "REPLACE_WITH_BASE64_32_BYTES"
+compaction_interval_secs = 300
 
 [sharding]
 shard_count = 4

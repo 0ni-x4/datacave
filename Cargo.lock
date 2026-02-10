@@ -580,12 +580,14 @@ dependencies = [
  "rustls 0.22.4",
  "rustls-pemfile",
  "serde",
+ "sqlparser",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

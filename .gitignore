@@ -6,3 +6,4 @@ data/
 **/*.pem
 **/*.key
 **/*.crt
+git-ignored/

@@ -53,7 +53,8 @@ async fn main() -> anyhow::Result<()> {
         Command::GenPasswordHash { password } => {
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
-                .hash_password(password.as_bytes(), &salt)?
+                .hash_password(password.as_bytes(), &salt)
+                .map_err(|err| anyhow::anyhow!("hash error: {err}"))?
                 .to_string();
             println!("{hash}");
         }

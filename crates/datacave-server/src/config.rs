@@ -14,6 +14,7 @@ pub struct Config {
 pub struct ServerConfig {
     pub listen_addr: String,
     pub max_connections: usize,
+    pub idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -24,6 +25,7 @@ pub struct StorageConfig {
     pub sstable_target_bytes: usize,
     pub encryption_enabled: bool,
     pub encryption_key_base64: Option<String>,
+    pub compaction_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -86,7 +88,7 @@ pub struct RoleConfig {
 impl Config {
     pub fn from_path(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config = toml::from_str(&contents)?;
+        let config: Config = toml::from_str(&contents)?;
         config.validate()?;
         Ok(config)
     }

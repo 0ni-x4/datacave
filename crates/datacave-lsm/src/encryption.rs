@@ -2,10 +2,17 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{anyhow, Result};
 use rand::RngCore;
+use std::fmt;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DataEncryptor {
     cipher: Aes256Gcm,
+}
+
+impl fmt::Debug for DataEncryptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DataEncryptor { cipher: \"aes-256-gcm\" }")
+    }
 }
 
 impl DataEncryptor {
@@ -13,7 +20,8 @@ impl DataEncryptor {
         if key_bytes.len() != 32 {
             return Err(anyhow!("encryption key must be 32 bytes"));
         }
-        let cipher = Aes256Gcm::new_from_slice(key_bytes)?;
+        let cipher = Aes256Gcm::new_from_slice(key_bytes)
+            .map_err(|err| anyhow!("invalid key length: {err}"))?;
         Ok(Self { cipher })
     }
 
@@ -21,7 +29,10 @@ impl DataEncryptor {
         let mut nonce_bytes = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = self.cipher.encrypt(nonce, plaintext)?;
+        let ciphertext = self
+            .cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|err| anyhow!("encryption failed: {err}"))?;
         let mut out = Vec::with_capacity(12 + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
@@ -34,7 +45,10 @@ impl DataEncryptor {
         }
         let (nonce_bytes, ciphertext) = data.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let plaintext = self.cipher.decrypt(nonce, ciphertext)?;
+        let plaintext = self
+            .cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|err| anyhow!("decryption failed: {err}"))?;
         Ok(plaintext)
     }
 }

@@ -127,6 +127,7 @@ impl LsmEngine {
         if mem.iter().next().is_none() {
             return Ok(());
         }
+        metrics::counter!("lsm_flush_total").increment(1);
         let entries: Vec<SstEntry> = mem
             .iter()
             .map(|(key, value)| SstEntry {
@@ -149,6 +150,7 @@ impl LsmEngine {
         if tables.len() < 2 {
             return Ok(());
         }
+        metrics::counter!("lsm_compact_total").increment(1);
         let output = format!("{}/sst-compacted-{}.db", self.options.data_dir, chrono_suffix());
         compact_tables(&output, &tables, self.encryptor.as_ref()).await?;
         info!("compacted {} tables into {}", tables.len(), output);
@@ -199,7 +201,7 @@ fn is_key_match(versioned_key: &[u8], key: &[u8], snapshot: Version) -> bool {
     version <= snapshot
 }
 
-fn mem_get_latest(mem: &MemTable, key: &[u8], snapshot: Version) -> Option<&Vec<u8>> {
+fn mem_get_latest<'a>(mem: &'a MemTable, key: &[u8], snapshot: Version) -> Option<&'a Vec<u8>> {
     let mut upper = Vec::with_capacity(key.len() + 8);
     upper.extend_from_slice(key);
     upper.extend_from_slice(&snapshot.to_be_bytes());

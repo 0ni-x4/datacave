@@ -19,7 +19,8 @@ fn sql_parse_bench(c: &mut Criterion) {
 fn sql_end_to_end_bench(c: &mut Criterion) {
     let rt = Runtime::new().expect("runtime");
     c.bench_function("sql_end_to_end", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
+            rt.block_on(async {
             let dir = TempDir::new().expect("tempdir");
             let data_dir = dir.path().join("data");
             std::fs::create_dir_all(&data_dir).expect("data dir");
@@ -46,6 +47,7 @@ fn sql_end_to_end_bench(c: &mut Criterion) {
             executor.execute(&stmts[0], Some("bench")).await.expect("insert");
             let stmts = parse_sql("SELECT * FROM users;").expect("parse");
             let _ = executor.execute(&stmts[0], Some("bench")).await.expect("select");
+            })
         })
     });
 }

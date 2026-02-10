@@ -38,7 +38,8 @@ impl AuthManager {
             .get(username)
             .ok_or_else(|| anyhow!("unknown user"))?;
         if let Some(hash) = &user.password_hash {
-            let parsed = PasswordHash::new(hash)?;
+            let parsed = PasswordHash::new(hash)
+                .map_err(|err| anyhow!("invalid password hash: {err}"))?;
             Argon2::default()
                 .verify_password(password.as_bytes(), &parsed)
                 .map_err(|_| anyhow!("invalid password"))?;

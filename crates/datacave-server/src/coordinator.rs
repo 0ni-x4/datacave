@@ -1,5 +1,5 @@
 use datacave_core::types::SqlResult;
-use sqlparser::ast::{Query, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{FromTable, ObjectName, Query, SetExpr, Statement, TableFactor, TableWithJoins};
 
 #[derive(Debug, Clone)]
 pub struct ShardPlan {
@@ -73,9 +73,15 @@ fn table_name(stmt: &Statement) -> Option<String> {
     match stmt {
         Statement::Insert { table_name, .. } => Some(table_name.to_string()),
         Statement::Update { table, .. } => Some(table.to_string()),
-        Statement::Delete { table_name, .. } => Some(table_name.to_string()),
+        Statement::Delete { from, .. } => first_from_table(from)
+            .and_then(|relation| match &relation.relation {
+                TableFactor::Table { name, .. } => Some(name.to_string()),
+                _ => None,
+            }),
         Statement::CreateTable { name, .. } => Some(name.to_string()),
-        Statement::Drop { names, .. } => names.get(0).map(|name| name.to_string()),
+        Statement::Drop { names, .. } => {
+            names.get(0).map(|name: &ObjectName| name.to_string())
+        }
         Statement::Query(query) => table_from_query(query),
         _ => None,
     }
@@ -91,6 +97,13 @@ fn table_from_query(query: &Query) -> Option<String> {
                 _ => None,
             }),
         _ => None,
+    }
+}
+
+fn first_from_table(from: &FromTable) -> Option<&TableWithJoins> {
+    match from {
+        FromTable::WithFromKeyword(relations) => relations.first(),
+        FromTable::WithoutKeyword(relations) => relations.first(),
     }
 }
 

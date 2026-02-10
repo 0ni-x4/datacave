@@ -6,7 +6,8 @@ use tokio::runtime::Runtime;
 fn lsm_put_get_bench(c: &mut Criterion) {
     let rt = Runtime::new().expect("runtime");
     c.bench_function("lsm_put_get", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
+            rt.block_on(async {
             let dir = TempDir::new().expect("tempdir");
             let data_dir = dir.path().join("data");
             std::fs::create_dir_all(&data_dir).expect("data dir");
@@ -23,7 +24,8 @@ fn lsm_put_get_bench(c: &mut Criterion) {
             let key = b"user:bench";
             engine.put(key, b"value", 1).await.expect("put");
             let _ = engine.get(key, 1).await.expect("get");
-        });
+            });
+        })
     });
 }
 

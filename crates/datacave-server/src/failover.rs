@@ -8,7 +8,7 @@ pub struct NodeHealth {
     pub last_heartbeat: Instant,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FailoverManager {
     health: Arc<Mutex<HashMap<String, NodeHealth>>>,
 }

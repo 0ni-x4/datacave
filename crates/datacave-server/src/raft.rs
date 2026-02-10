@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RaftConfig {
     pub replication_factor: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RaftManager {
     config: RaftConfig,
     leaders: Arc<Mutex<HashMap<usize, usize>>>,
