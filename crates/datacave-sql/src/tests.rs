@@ -20,6 +20,7 @@ mod tests {
                 wal_path: wal_path.to_string_lossy().to_string(),
                 memtable_max_bytes: 1024,
                 encryption_key: None,
+                wal_enabled: true,
             })
             .await
             .expect("open"),

@@ -87,6 +87,38 @@ impl Config {
     pub fn from_path(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config = toml::from_str(&contents)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.storage.encryption_enabled && self.storage.encryption_key_base64.is_none() {
+            return Err(anyhow::anyhow!("storage encryption enabled but key missing"));
+        }
+        if self.security.tls.enabled {
+            if self.security.tls.cert_path.is_none() || self.security.tls.key_path.is_none() {
+                return Err(anyhow::anyhow!("tls enabled but cert_path or key_path missing"));
+            }
+        }
+        if self.security.auth.enabled && self.security.auth.users.is_empty() {
+            return Err(anyhow::anyhow!("auth enabled but no users configured"));
+        }
+        if self.security.auth.enabled {
+            for user in &self.security.auth.users {
+                if user.password_hash.is_none() && user.password_plain.is_none() {
+                    return Err(anyhow::anyhow!(format!(
+                        "user {} has no password configured",
+                        user.username
+                    )));
+                }
+                if user.roles.is_empty() {
+                    return Err(anyhow::anyhow!(format!(
+                        "user {} has no roles configured",
+                        user.username
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }

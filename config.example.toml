@@ -47,7 +47,6 @@ is_admin = true
 
 [[security.auth.users]]
 username = "admin"
-password_hash = "$argon2id$v=19$m=65536,t=2,p=1$REPLACE_WITH_SALT$REPLACE_WITH_HASH"
 password_plain = "change-me"
 roles = ["admin"]
 

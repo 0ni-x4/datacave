@@ -14,6 +14,7 @@ pub struct LsmOptions {
     pub wal_path: String,
     pub memtable_max_bytes: usize,
     pub encryption_key: Option<Vec<u8>>,
+    pub wal_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -32,10 +33,32 @@ impl LsmEngine {
             None => None,
         };
         let wal = Wal::open(&options.wal_path, encryptor.clone()).await?;
+        let mut memtable = MemTable::new();
+        if options.wal_enabled {
+            let entries = Wal::replay(&options.wal_path, encryptor.clone()).await?;
+            for (op, key, value) in entries {
+                match op {
+                    WalOp::Put | WalOp::Delete => {
+                        memtable.put(key, value);
+                    }
+                }
+            }
+        }
+        let mut sstables = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&options.data_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("sst-") && name.ends_with(".db") {
+                        sstables.push(SSTable::new(entry.path().to_string_lossy().to_string()));
+                    }
+                }
+            }
+            sstables.sort_by(|a, b| a.path.cmp(&b.path));
+        }
         Ok(Self {
-            memtable: Mutex::new(MemTable::new()),
+            memtable: Mutex::new(memtable),
             wal: Mutex::new(wal),
-            sstables: Mutex::new(Vec::new()),
+            sstables: Mutex::new(sstables),
             options,
             encryptor,
         })
@@ -45,11 +68,13 @@ impl LsmEngine {
         metrics::counter!("lsm_put").increment(1);
         let encoded_key = encode_versioned_key(key, version);
         let encoded_value = encode_value(Some(value));
-        self.wal
-            .lock()
-            .await
-            .append(WalOp::Put, &encoded_key, &encoded_value)
-            .await?;
+        if self.options.wal_enabled {
+            self.wal
+                .lock()
+                .await
+                .append(WalOp::Put, &encoded_key, &encoded_value)
+                .await?;
+        }
         self.memtable
             .lock()
             .await
@@ -64,11 +89,13 @@ impl LsmEngine {
         metrics::counter!("lsm_delete").increment(1);
         let encoded_key = encode_versioned_key(key, version);
         let encoded_value = encode_value(None);
-        self.wal
-            .lock()
-            .await
-            .append(WalOp::Delete, &encoded_key, &encoded_value)
-            .await?;
+        if self.options.wal_enabled {
+            self.wal
+                .lock()
+                .await
+                .append(WalOp::Delete, &encoded_key, &encoded_value)
+                .await?;
+        }
         self.memtable
             .lock()
             .await
@@ -111,6 +138,9 @@ impl LsmEngine {
         SSTable::write_with(&sst_path, &entries, self.encryptor.as_ref()).await?;
         self.sstables.lock().await.push(SSTable::new(sst_path));
         mem.clear();
+        if self.options.wal_enabled {
+            self.wal.lock().await.reset().await?;
+        }
         Ok(())
     }
 

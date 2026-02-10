@@ -1,7 +1,7 @@
 use crate::encryption::DataEncryptor;
 use anyhow::Result;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 #[derive(Debug, Clone, Copy)]
 pub enum WalOp {
@@ -46,6 +46,12 @@ impl Wal {
         self.file.write_u32_le(value_len).await?;
         self.file.write_all(&value).await?;
         self.file.flush().await?;
+        Ok(())
+    }
+
+    pub async fn reset(&mut self) -> Result<()> {
+        self.file.set_len(0).await?;
+        self.file.seek(std::io::SeekFrom::Start(0)).await?;
         Ok(())
     }
 

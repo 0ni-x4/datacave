@@ -19,7 +19,13 @@ rustls-pemfile = "2"
 base64 = "0.22"
 argon2 = "0.5"
 password-hash = "0.5"
+clap = { version = "4", features = ["derive"] }
+rand_core = "0.6"
 datacave-core = { path = "../datacave-core" }
 datacave-lsm = { path = "../datacave-lsm" }
 datacave-sql = { path = "../datacave-sql" }
 datacave-protocol = { path = "../datacave-protocol" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

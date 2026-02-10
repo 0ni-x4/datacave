@@ -2,7 +2,7 @@
 
 ![Datacave logo](./datacave.png)
 
-Datacave is a high-performance, distributed SQL database built in Rust. It couples an LSM-based storage engine with PostgreSQL wire compatibility and horizontal scaling, aiming to provide a familiar SQL interface with modern storage performance.
+Datacave is a high-performance, distributed SQL database built in Rust from the ground up. It uses its own LSM-based storage engine and SQL layer; for easy connectivity it speaks the PostgreSQL wire protocol and SQL dialect, so you can use existing Postgres clients and tools while the storage and execution are entirely Datacave.
 
 ## Highlights
 
@@ -18,7 +18,7 @@ Datacave is organized as a set of focused crates that compose into a full databa
 - `datacave-core`: core types, errors, catalog, and shared traits
 - `datacave-lsm`: LSM storage engine
 - `datacave-sql`: SQL parsing, planning, and execution
-- `datacave-protocol`: PostgreSQL wire protocol handling
+- `datacave-protocol`: PostgreSQL wire protocol (client compatibility only; no Postgres server dependency)
 - `datacave-server`: server binary and connection handling
 
 Data flows from protocol handling to query planning and execution, then into the LSM engine for storage. This separation keeps the wire protocol, SQL layer, and storage engine independently testable and replaceable.
@@ -39,7 +39,7 @@ cargo run -p datacave-server -- serve --config config.example.toml
 ### Connect with psql
 
 ```
-psql "host=127.0.0.1 port=5432 user=datacave dbname=default"
+psql "host=127.0.0.1 port=5433 user=admin dbname=default"
 ```
 
 ## Configuration
@@ -48,8 +48,37 @@ Datacave loads configuration from a TOML file. The `config.example.toml` file do
 
 - Listen address and port
 - Storage path and engine options
-- Logging verbosity
-- Protocol and session limits
+- Sharding and replication factor
+- Metrics and health endpoints
+- TLS and authentication settings
+
+### Admin Commands
+
+Generate a password hash for config:
+
+```
+cargo run -p datacave-server -- gen-password-hash --password "change-me"
+```
+
+## Observability
+
+- Metrics: `GET /metrics` on the metrics listen address
+- Health: `GET /health`
+- Readiness: `GET /ready`
+
+## SQL Compatibility Matrix
+
+Supported today:
+- `CREATE TABLE`
+- `INSERT`
+- `SELECT`
+- `UPDATE`
+- `DELETE`
+
+Not yet supported:
+- Joins
+- Aggregations
+- Transactions
 
 ## Development
 
@@ -69,6 +98,13 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+### Benchmarks
+
+```
+cargo bench -p datacave-lsm
+cargo bench -p datacave-sql
+```
+
 ### Lint and Format
 
 ```
@@ -78,7 +114,7 @@ cargo clippy --workspace --all-targets
 
 ## Security and Encryption
 
-Datacave includes encryption primitives and is designed to keep storage and protocol concerns isolated. Review the `datacave-lsm` crate for storage-level details and the server crate for authentication and session handling.
+Datacave supports optional TLS, authentication, audit logging, and encryption at rest. Configure these in `config.example.toml`. The server uses cleartext password auth in a way that Postgres clients understand, and storage encryption applies to WAL and SSTable files.
 
 ## Roadmap
 

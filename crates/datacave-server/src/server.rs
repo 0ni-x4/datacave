@@ -16,7 +16,7 @@ use sqlparser::ast::Statement;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use metrics::counter;
@@ -25,7 +25,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs::File;
 use std::io::BufReader;
-use base64;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use rustls;
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -48,6 +49,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     info!("Datacave listening on {}", config.server.listen_addr);
 
     let router = ShardRouter::new(&config).await?;
+    let connection_limit = Arc::new(Semaphore::new(config.server.max_connections));
     let auth = if config.security.auth.enabled {
         Some(Arc::new(AuthManager::new(&config.security.auth)?))
     } else {
@@ -57,9 +59,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     loop {
         let (mut socket, _) = listener.accept().await?;
         let router = router.clone();
+        let permit = match connection_limit.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
         let auth = auth.clone();
         let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Some(acceptor) = tls_acceptor {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
@@ -175,6 +182,7 @@ impl ShardRouter {
                     wal_path,
                     memtable_max_bytes: config.storage.memtable_max_bytes,
                     encryption_key: load_encryption_key(&config),
+                    wal_enabled: config.storage.wal_enabled,
                 };
                 let (tx, rx) = mpsc::channel(128);
                 let shard = Shard::new(options).await?;
@@ -216,7 +224,7 @@ impl ShardRouter {
             .find(|replica| replica.replica_id == leader_id)
             .ok_or_else(|| anyhow::anyhow!("leader not found"))?;
 
-        let read_only = matches!(plan.stmt, Statement::Query(_));
+        let read_only = matches!(&plan.stmt, Statement::Query(_));
         let leader_result = leader.execute(&plan.stmt, tenant_id.clone()).await?;
 
         if !read_only {
@@ -365,7 +373,7 @@ fn load_encryption_key(config: &Config) -> Option<Vec<u8>> {
         return None;
     }
     let encoded = config.storage.encryption_key_base64.as_ref()?;
-    base64::decode(encoded).ok()
+    STANDARD.decode(encoded).ok()
 }
 
 async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -524,4 +532,119 @@ fn build_tls_acceptor(config: &Config) -> anyhow::Result<TlsAcceptor> {
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AuthConfig, AuditConfig, ClusterConfig, MetricsConfig, SecurityConfig, ServerConfig, ShardingConfig, StorageConfig, TlsConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_config(data_dir: &str) -> Config {
+        Config {
+            server: ServerConfig {
+                listen_addr: "127.0.0.1:0".into(),
+                max_connections: 8,
+            },
+            storage: StorageConfig {
+                data_dir: data_dir.into(),
+                wal_enabled: true,
+                memtable_max_bytes: 1024,
+                sstable_target_bytes: 1024,
+                encryption_enabled: false,
+                encryption_key_base64: None,
+            },
+            sharding: ShardingConfig { shard_count: 1 },
+            cluster: ClusterConfig {
+                replication_factor: 1,
+            },
+            metrics: MetricsConfig {
+                listen_addr: "127.0.0.1:0".into(),
+            },
+            security: SecurityConfig {
+                tls: TlsConfig {
+                    enabled: false,
+                    cert_path: None,
+                    key_path: None,
+                },
+                auth: AuthConfig {
+                    enabled: false,
+                    users: Vec::new(),
+                    roles: Vec::new(),
+                },
+                audit: AuditConfig { enabled: false },
+            },
+        }
+    }
+
+    async fn read_message_type(mut reader: impl AsyncRead + Unpin) -> u8 {
+        let mut typ = [0u8; 1];
+        reader.read_exact(&mut typ).await.expect("type");
+        let mut len_bytes = [0u8; 4];
+        reader.read_exact(&mut len_bytes).await.expect("len");
+        let len = i32::from_be_bytes(len_bytes) as usize;
+        if len > 4 {
+            let mut skip = vec![0u8; len - 4];
+            reader.read_exact(&mut skip).await.expect("payload");
+        }
+        typ[0]
+    }
+
+    #[tokio::test]
+    async fn query_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(2048);
+        tokio::spawn(async move {
+            handle_client(server, router, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let auth_type = read_message_type(&mut client).await;
+        assert_eq!(auth_type, b'R');
+        let ready_type = read_message_type(&mut client).await;
+        assert_eq!(ready_type, b'Z');
+
+        let sql = "CREATE TABLE t (id INT);";
+        let mut query = Vec::new();
+        query.push(b'Q');
+        let mut payload = Vec::new();
+        payload.extend_from_slice(sql.as_bytes());
+        payload.push(0);
+        let len = (payload.len() + 4) as i32;
+        query.extend_from_slice(&len.to_be_bytes());
+        query.extend_from_slice(&payload);
+        client.write_all(&query).await.expect("query");
+
+        let _ = read_message_type(&mut client).await;
+        let ready_type = read_message_type(&mut client).await;
+        assert_eq!(ready_type, b'Z');
+    }
+
+    #[tokio::test]
+    async fn failover_selects_new_leader() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut config = test_config(dir.path().to_string_lossy().as_ref());
+        config.cluster.replication_factor = 2;
+        let router = ShardRouter::new(&config).await.expect("router");
+        let group = &router.shard_groups[0];
+        let leader = router.select_leader(group);
+        let leader_node = group
+            .replicas
+            .iter()
+            .find(|replica| replica.replica_id == leader)
+            .expect("leader");
+        router.failover.mark_unhealthy(&leader_node.node_id);
+        let next = router.select_leader(group);
+        assert_ne!(leader, next);
+    }
 }

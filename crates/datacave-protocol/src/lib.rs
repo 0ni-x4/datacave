@@ -4,3 +4,6 @@ pub mod messages;
 
 pub use backend::BackendMessage;
 pub use frontend::FrontendMessage;
+
+#[cfg(test)]
+mod tests;

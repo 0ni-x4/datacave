@@ -1,0 +1,8 @@
+target/
+data/
+*.log
+.DS_Store
+**/.env
+**/*.pem
+**/*.key
+**/*.crt
