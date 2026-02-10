@@ -1,0 +1,208 @@
+   0.058164791s  INFO prepare_target{force=false package_id=datacave-lsm v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-lsm) target="datacave_lsm"}: cargo::core::compiler::fingerprint: fingerprint error for datacave-lsm v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-lsm)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("datacave_lsm", ["lib"], "/Users/0ni/Developer/datacave/crates/datacave-lsm/src/lib.rs", Edition2021) }
+   0.058183916s  INFO prepare_target{force=false package_id=datacave-lsm v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-lsm) target="datacave_lsm"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/0ni/Developer/datacave/target/debug/.fingerprint/datacave-lsm-23a339b12c1b9e4e/lib-datacave_lsm`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.062581666s  INFO prepare_target{force=false package_id=datacave-lsm v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-lsm) target="datacave_lsm"}: cargo::core::compiler::fingerprint: fingerprint error for datacave-lsm v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-lsm)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("datacave_lsm", ["lib"], "/Users/0ni/Developer/datacave/crates/datacave-lsm/src/lib.rs", Edition2021) }
+   0.062595166s  INFO prepare_target{force=false package_id=datacave-lsm v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-lsm) target="datacave_lsm"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/0ni/Developer/datacave/target/debug/.fingerprint/datacave-lsm-334291f030abd3cd/test-lib-datacave_lsm`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.063174125s  INFO prepare_target{force=false package_id=datacave-protocol v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-protocol) target="datacave_protocol"}: cargo::core::compiler::fingerprint: fingerprint error for datacave-protocol v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-protocol)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("datacave_protocol", ["lib"], "/Users/0ni/Developer/datacave/crates/datacave-protocol/src/lib.rs", Edition2021) }
+   0.063179708s  INFO prepare_target{force=false package_id=datacave-protocol v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-protocol) target="datacave_protocol"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/0ni/Developer/datacave/target/debug/.fingerprint/datacave-protocol-1a119def1cc051af/lib-datacave_protocol`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.063398041s  INFO prepare_target{force=false package_id=datacave-protocol v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-protocol) target="datacave_protocol"}: cargo::core::compiler::fingerprint: fingerprint error for datacave-protocol v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-protocol)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("datacave_protocol", ["lib"], "/Users/0ni/Developer/datacave/crates/datacave-protocol/src/lib.rs", Edition2021) }
+   0.063403000s  INFO prepare_target{force=false package_id=datacave-protocol v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-protocol) target="datacave_protocol"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/0ni/Developer/datacave/target/debug/.fingerprint/datacave-protocol-3d3e2e6a1e004e2f/test-lib-datacave_protocol`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.067614666s  INFO prepare_target{force=false package_id=datacave-server v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-server) target="datacave-server"}: cargo::core::compiler::fingerprint: fingerprint error for datacave-server v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-server)/Check { test: false }/TargetInner { name: "datacave-server", doc: true, ..: with_path("/Users/0ni/Developer/datacave/crates/datacave-server/src/main.rs", Edition2021) }
+   0.067622166s  INFO prepare_target{force=false package_id=datacave-server v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-server) target="datacave-server"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/0ni/Developer/datacave/target/debug/.fingerprint/datacave-server-641fb8435c0f2a96/bin-datacave-server`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.069596541s  INFO prepare_target{force=false package_id=datacave-sql v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-sql) target="datacave_sql"}: cargo::core::compiler::fingerprint: fingerprint error for datacave-sql v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-sql)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("datacave_sql", ["lib"], "/Users/0ni/Developer/datacave/crates/datacave-sql/src/lib.rs", Edition2021) }
+   0.069602208s  INFO prepare_target{force=false package_id=datacave-sql v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-sql) target="datacave_sql"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/0ni/Developer/datacave/target/debug/.fingerprint/datacave-sql-cffa21396bc9d4ff/lib-datacave_sql`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.072610916s  INFO prepare_target{force=false package_id=datacave-server v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-server) target="datacave-server"}: cargo::core::compiler::fingerprint: fingerprint error for datacave-server v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-server)/Check { test: true }/TargetInner { name: "datacave-server", doc: true, ..: with_path("/Users/0ni/Developer/datacave/crates/datacave-server/src/main.rs", Edition2021) }
+   0.072620416s  INFO prepare_target{force=false package_id=datacave-server v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-server) target="datacave-server"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/0ni/Developer/datacave/target/debug/.fingerprint/datacave-server-112269e80b8b32f2/test-bin-datacave-server`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.073086541s  INFO prepare_target{force=false package_id=datacave-sql v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-sql) target="datacave_sql"}: cargo::core::compiler::fingerprint: fingerprint error for datacave-sql v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-sql)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("datacave_sql", ["lib"], "/Users/0ni/Developer/datacave/crates/datacave-sql/src/lib.rs", Edition2021) }
+   0.073091416s  INFO prepare_target{force=false package_id=datacave-sql v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-sql) target="datacave_sql"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/0ni/Developer/datacave/target/debug/.fingerprint/datacave-sql-cd79481da72b7c02/test-lib-datacave_sql`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+    Checking datacave-lsm v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-lsm)
+    Checking datacave-protocol v0.1.0 (/Users/0ni/Developer/datacave/crates/datacave-protocol)
+error: could not compile `datacave-protocol` (lib test) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `datacave-protocol` (lib) due to 2 previous errors
+error: could not compile `datacave-lsm` (lib) due to 5 previous errors
+error: could not compile `datacave-lsm` (lib test) due to 10 previous errors

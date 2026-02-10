@@ -1,0 +1,55 @@
+[server]
+listen_addr = "127.0.0.1:5433"
+max_connections = 1024
+
+[storage]
+data_dir = "./data"
+wal_enabled = true
+memtable_max_bytes = 67108864
+sstable_target_bytes = 134217728
+encryption_enabled = false
+encryption_key_base64 = "REPLACE_WITH_BASE64_32_BYTES"
+
+[sharding]
+shard_count = 4
+
+[cluster]
+replication_factor = 3
+
+[metrics]
+listen_addr = "127.0.0.1:9898"
+
+[security.tls]
+enabled = false
+cert_path = "./certs/server.crt"
+key_path = "./certs/server.key"
+
+[security.auth]
+enabled = true
+
+[[security.auth.roles]]
+name = "reader"
+can_read = true
+can_write = false
+is_admin = false
+
+[[security.auth.roles]]
+name = "writer"
+can_read = true
+can_write = true
+is_admin = false
+
+[[security.auth.roles]]
+name = "admin"
+can_read = true
+can_write = true
+is_admin = true
+
+[[security.auth.users]]
+username = "admin"
+password_hash = "$argon2id$v=19$m=65536,t=2,p=1$REPLACE_WITH_SALT$REPLACE_WITH_HASH"
+password_plain = "change-me"
+roles = ["admin"]
+
+[security.audit]
+enabled = true

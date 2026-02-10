@@ -1,0 +1,14 @@
+[workspace]
+members = [
+  "crates/datacave-core",
+  "crates/datacave-lsm",
+  "crates/datacave-sql",
+  "crates/datacave-protocol",
+  "crates/datacave-server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.1.0"
