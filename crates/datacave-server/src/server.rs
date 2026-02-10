@@ -9,7 +9,9 @@ use datacave_core::types::{DataValue, SqlResult};
 use datacave_lsm::engine::{LsmEngine, LsmOptions};
 use datacave_protocol::backend::write_message;
 use datacave_protocol::frontend::{read_message, read_startup};
-use datacave_protocol::messages::{BackendMessage, FrontendMessage};
+use datacave_protocol::messages::{
+    BackendMessage, CloseTarget, DescribeTarget, FrontendMessage, TransactionState,
+};
 use datacave_sql::executor::SqlExecutor;
 use datacave_sql::parse_sql;
 use sqlparser::ast::Statement;
@@ -99,19 +101,66 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A single response item for a multi-statement query.
+#[derive(Debug)]
+enum QueryResponseItem {
+    Rows(SqlResult),
+    CommandCompleteOnly(String),
+}
+
+fn is_transaction_control(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::StartTransaction { .. } | Statement::Commit { .. } | Statement::Rollback { .. }
+    )
+}
+
+fn transaction_command_tag(stmt: &Statement) -> Option<&'static str> {
+    match stmt {
+        Statement::StartTransaction { .. } => Some("BEGIN"),
+        Statement::Commit { .. } => Some("COMMIT"),
+        Statement::Rollback { .. } => Some("ROLLBACK"),
+        _ => None,
+    }
+}
+
+/// Returns true for statements that mutate state and should be buffered during a transaction.
+fn is_mutating_statement(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Insert { .. }
+            | Statement::Update { .. }
+            | Statement::Delete { .. }
+            | Statement::CreateTable { .. }
+    )
+}
+
+/// Returns rows_affected for buffered INSERT (best-effort from parsed values).
+fn buffered_insert_rows_affected(stmt: &Statement) -> u64 {
+    match stmt {
+        Statement::Insert { source, .. } => {
+            if let Some(src) = source {
+                if let sqlparser::ast::SetExpr::Values(v) = &*src.body {
+                    return v.rows.len() as u64;
+                }
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
 async fn handle_query(
     router: &ShardRouter,
     sql: &str,
     tenant_id: Option<String>,
     user: Option<&UserContext>,
-) -> anyhow::Result<SqlResult> {
+    in_tx: &mut bool,
+    tx_buffer: &mut Vec<Statement>,
+) -> anyhow::Result<Vec<QueryResponseItem>> {
     let statements = parse_sql(sql)?;
     let coordinator = Coordinator::new(router.shard_count());
-    let mut last = SqlResult {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        rows_affected: 0,
-    };
+    let mut items = Vec::new();
     for stmt in statements {
         counter!("sql_statement_total").increment(1);
         authorize_statement(user, &stmt)?;
@@ -126,38 +175,97 @@ async fn handle_query(
                 sql = sql
             );
         }
-        let routed = coordinator.route_plan(&stmt);
-        let mut results = Vec::new();
-        for plan in routed {
-            results.push(router.execute_plan(plan, tenant_id.clone()).await?);
+        if is_transaction_control(&stmt) {
+            let tag = transaction_command_tag(&stmt).unwrap();
+            match &stmt {
+                Statement::StartTransaction { .. } => {
+                    *in_tx = true;
+                    tx_buffer.clear();
+                }
+                Statement::Commit { .. } => {
+                    // Execute buffered statements atomically in order (best-effort)
+                    for buffered in tx_buffer.drain(..) {
+                        let routed = coordinator.route_plan(&buffered);
+                        for plan in routed {
+                            router.execute_plan(plan, tenant_id.clone()).await?;
+                        }
+                    }
+                    tx_buffer.clear();
+                    *in_tx = false;
+                }
+                Statement::Rollback { .. } => {
+                    tx_buffer.clear();
+                    *in_tx = false;
+                }
+                _ => {}
+            }
+            items.push(QueryResponseItem::CommandCompleteOnly(tag.to_string()));
+        } else if *in_tx && is_mutating_statement(&stmt) {
+            tx_buffer.push(stmt.clone());
+            let tag = if matches!(&stmt, Statement::Insert { .. }) {
+                let n = buffered_insert_rows_affected(&stmt);
+                format!("OK {}", n)
+            } else {
+                "OK".to_string()
+            };
+            items.push(QueryResponseItem::CommandCompleteOnly(tag));
+        } else {
+            // SELECT or auto-commit mutation: execute immediately.
+            // SELECT during transaction reads committed state only (no uncommitted visibility).
+            let routed = coordinator.route_plan(&stmt);
+            let mut results = Vec::new();
+            for plan in routed {
+                results.push(router.execute_plan(plan, tenant_id.clone()).await?);
+            }
+            let last = coordinator.aggregate(&stmt, results);
+            items.push(QueryResponseItem::Rows(last));
         }
-        last = coordinator.aggregate(&stmt, results);
     }
-    Ok(last)
+    Ok(items)
 }
 
-async fn write_sql_result<S: tokio::io::AsyncWrite + Unpin>(
+/// max_rows: 0 means no limit (return all rows).
+async fn write_query_response<S: tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
-    result: SqlResult,
+    items: &[QueryResponseItem],
+    max_rows: i32,
 ) -> anyhow::Result<()> {
-    if !result.columns.is_empty() {
-        let fields = result.columns.iter().map(|c| c.name.clone()).collect();
-        write_message(stream, BackendMessage::RowDescription { fields }).await?;
-        for row in result.rows {
-            let values = row
-                .values
-                .into_iter()
-                .map(|v| data_value_to_bytes(v))
-                .collect();
-            write_message(stream, BackendMessage::DataRow { values }).await?;
+    let row_limit = if max_rows > 0 {
+        max_rows as usize
+    } else {
+        usize::MAX
+    };
+    let mut rows_sent = 0usize;
+    for item in items {
+        match item {
+            QueryResponseItem::Rows(result) => {
+                if !result.columns.is_empty() {
+                    let fields = result.columns.iter().map(|c| c.name.clone()).collect();
+                    write_message(stream, BackendMessage::RowDescription { fields }).await?;
+                    let remaining = row_limit.saturating_sub(rows_sent);
+                    let rows_to_send = result.rows.iter().take(remaining);
+                    for row in rows_to_send {
+                        rows_sent += 1;
+                        let values = row
+                            .values
+                            .iter()
+                            .map(|v| data_value_to_bytes(v.clone()))
+                            .collect();
+                        write_message(stream, BackendMessage::DataRow { values }).await?;
+                    }
+                }
+                let tag = if result.rows_affected > 0 {
+                    format!("OK {}", result.rows_affected)
+                } else {
+                    "OK".to_string()
+                };
+                write_message(stream, BackendMessage::CommandComplete { tag }).await?;
+            }
+            QueryResponseItem::CommandCompleteOnly(tag) => {
+                write_message(stream, BackendMessage::CommandComplete { tag: tag.clone() }).await?;
+            }
         }
     }
-    let tag = if result.rows_affected > 0 {
-        format!("OK {}", result.rows_affected)
-    } else {
-        "OK".to_string()
-    };
-    write_message(stream, BackendMessage::CommandComplete { tag }).await?;
     Ok(())
 }
 
@@ -485,7 +593,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         },
     )
     .await;
-    let _ = write_message(&mut stream, BackendMessage::ReadyForQuery).await;
+    let mut in_tx = false;
+    let mut tx_buffer: Vec<Statement> = Vec::new();
+    let mut prepared_statements: HashMap<String, String> = HashMap::new();
+    let mut portals: HashMap<String, String> = HashMap::new();
+    let _ = write_message(
+        &mut stream,
+        BackendMessage::ReadyForQuery {
+            state: TransactionState::Idle,
+        },
+    )
+    .await;
 
     info!("connection started {}", connection_id);
     loop {
@@ -517,14 +635,23 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             FrontendMessage::Query { sql } => {
                 let span = tracing::info_span!("query", connection_id = connection_id.as_str());
                 let _enter = span.enter();
-                let result = handle_query(&router, &sql, tenant_id.clone(), user_ctx.as_ref()).await;
+                let result = handle_query(
+                    &router,
+                    &sql,
+                    tenant_id.clone(),
+                    user_ctx.as_ref(),
+                    &mut in_tx,
+                    &mut tx_buffer,
+                )
+                .await;
                 match result {
-                    Ok(result) => {
+                    Ok(items) => {
                         counter!("sql_query_success_total").increment(1);
-                        let _ = write_sql_result(&mut stream, result).await;
+                        let _ = write_query_response(&mut stream, &items, 0).await;
                     }
                     Err(err) => {
                         counter!("sql_query_error_total").increment(1);
+                        in_tx = false;
                         let _ = write_message(
                             &mut stream,
                             BackendMessage::ErrorResponse {
@@ -534,9 +661,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         .await;
                     }
                 }
-                let _ = write_message(&mut stream, BackendMessage::ReadyForQuery).await;
+                let state = if in_tx {
+                    TransactionState::Transaction
+                } else {
+                    TransactionState::Idle
+                };
+                let _ = write_message(
+                    &mut stream,
+                    BackendMessage::ReadyForQuery { state },
+                )
+                .await;
             }
-            FrontendMessage::Terminate => break,
             FrontendMessage::Unsupported { code } => {
                 let _ = write_message(
                     &mut stream,
@@ -545,7 +680,187 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     },
                 )
                 .await;
-                let _ = write_message(&mut stream, BackendMessage::ReadyForQuery).await;
+                let state = if in_tx {
+                    TransactionState::Transaction
+                } else {
+                    TransactionState::Idle
+                };
+                let _ = write_message(
+                    &mut stream,
+                    BackendMessage::ReadyForQuery { state },
+                )
+                .await;
+            }
+            FrontendMessage::Parse {
+                statement_name,
+                query,
+                ..
+            } => {
+                prepared_statements.insert(statement_name, query);
+                let _ = write_message(&mut stream, BackendMessage::ParseComplete).await;
+            }
+            FrontendMessage::Bind {
+                portal_name,
+                statement_name,
+                ..
+            } => {
+                let resolved_sql = prepared_statements
+                    .get(&statement_name)
+                    .cloned()
+                    .or_else(|| prepared_statements.get("").cloned());
+                match resolved_sql {
+                    Some(sql) => {
+                        portals.insert(portal_name, sql);
+                        let _ = write_message(&mut stream, BackendMessage::BindComplete).await;
+                    }
+                    None => {
+                        let _ = write_message(
+                            &mut stream,
+                            BackendMessage::ErrorResponse {
+                                message: format!(
+                                    "unknown prepared statement '{}'",
+                                    statement_name
+                                ),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            FrontendMessage::Describe { target, name } => {
+                let sql = match target {
+                    DescribeTarget::Statement => prepared_statements
+                        .get(&name)
+                        .cloned()
+                        .or_else(|| prepared_statements.get("").cloned()),
+                    DescribeTarget::Portal => portals
+                        .get(&name)
+                        .cloned()
+                        .or_else(|| portals.get("").cloned()),
+                };
+                match sql {
+                    Some(sql) => {
+                        let stmts = match parse_sql(&sql) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                let _ = write_message(&mut stream, BackendMessage::NoData).await;
+                                continue;
+                            }
+                        };
+                        if stmts.len() == 1 {
+                            let stmt = &stmts[0];
+                            if matches!(stmt, Statement::Query(_)) {
+                                let mut dummy_tx = in_tx;
+                                let mut dummy_buf = Vec::new();
+                                if let Ok(items) = handle_query(
+                                    &router,
+                                    &sql,
+                                    tenant_id.clone(),
+                                    user_ctx.as_ref(),
+                                    &mut dummy_tx,
+                                    &mut dummy_buf,
+                                )
+                                .await
+                                {
+                                    if let Some(QueryResponseItem::Rows(result)) = items.first() {
+                                        if !result.columns.is_empty() {
+                                            let fields =
+                                                result.columns.iter().map(|c| c.name.clone()).collect();
+                                            let _ = write_message(
+                                                &mut stream,
+                                                BackendMessage::RowDescription { fields },
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let _ = write_message(&mut stream, BackendMessage::NoData).await;
+                    }
+                    None => {
+                        let _ = write_message(
+                            &mut stream,
+                            BackendMessage::ErrorResponse {
+                                message: format!(
+                                    "unknown {} '{}'",
+                                    if matches!(target, DescribeTarget::Statement) {
+                                        "prepared statement"
+                                    } else {
+                                        "portal"
+                                    },
+                                    name
+                                ),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            FrontendMessage::Execute { portal_name, max_rows } => {
+                let sql = portals
+                    .get(&portal_name)
+                    .cloned()
+                    .or_else(|| portals.get("").cloned());
+                match sql {
+                    Some(sql) => {
+                        let result = handle_query(
+                            &router,
+                            &sql,
+                            tenant_id.clone(),
+                            user_ctx.as_ref(),
+                            &mut in_tx,
+                            &mut tx_buffer,
+                        )
+                        .await;
+                        match result {
+                            Ok(items) => {
+                                counter!("sql_query_success_total").increment(1);
+                                let _ = write_query_response(&mut stream, &items, max_rows).await;
+                            }
+                            Err(err) => {
+                                counter!("sql_query_error_total").increment(1);
+                                in_tx = false;
+                                let _ = write_message(
+                                    &mut stream,
+                                    BackendMessage::ErrorResponse {
+                                        message: err.to_string(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = write_message(
+                            &mut stream,
+                            BackendMessage::ErrorResponse {
+                                message: format!("unknown portal '{}'", portal_name),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            FrontendMessage::Close { target, name } => {
+                match target {
+                    CloseTarget::Statement => {
+                        prepared_statements.remove(&name);
+                    }
+                    CloseTarget::Portal => {
+                        portals.remove(&name);
+                    }
+                }
+                let _ = write_message(&mut stream, BackendMessage::CloseComplete).await;
+            }
+            FrontendMessage::Sync => {
+                let state = if in_tx {
+                    TransactionState::Transaction
+                } else {
+                    TransactionState::Idle
+                };
+                let _ = write_message(&mut stream, BackendMessage::ReadyForQuery { state }).await;
             }
             _ => {}
         }
@@ -643,6 +958,99 @@ mod tests {
         typ[0]
     }
 
+    async fn send_query(client: &mut (impl AsyncRead + AsyncWrite + Unpin), sql: &str) {
+        let mut query = Vec::new();
+        query.push(b'Q');
+        let mut payload = Vec::new();
+        payload.extend_from_slice(sql.as_bytes());
+        payload.push(0);
+        let len = (payload.len() + 4) as i32;
+        query.extend_from_slice(&len.to_be_bytes());
+        query.extend_from_slice(&payload);
+        client.write_all(&query).await.expect("write query");
+    }
+
+    async fn send_frontend_msg(
+        client: &mut (impl AsyncRead + AsyncWrite + Unpin),
+        msg_type: u8,
+        payload: &[u8],
+    ) {
+        let mut msg = Vec::with_capacity(1 + 4 + payload.len());
+        msg.push(msg_type);
+        msg.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        msg.extend_from_slice(payload);
+        client.write_all(&msg).await.expect("write frontend msg");
+    }
+
+    async fn read_until_ready(
+        client: &mut (impl AsyncRead + Unpin),
+    ) -> (Vec<Vec<Option<Vec<u8>>>>, Option<String>, Option<String>, u8) {
+        let mut data_rows = Vec::new();
+        let mut error_msg = None;
+        let mut cmd_tag = None;
+        let mut ready_state = b'I';
+        loop {
+            let mut typ = [0u8; 1];
+            client.read_exact(&mut typ).await.expect("read type");
+            let mut len_bytes = [0u8; 4];
+            client.read_exact(&mut len_bytes).await.expect("read len");
+            let len = i32::from_be_bytes(len_bytes) as usize;
+            let mut payload = vec![0u8; len.saturating_sub(4)];
+            if !payload.is_empty() {
+                client.read_exact(&mut payload).await.expect("read payload");
+            }
+            match typ[0] {
+                b'D' => {
+                    if payload.len() >= 2 {
+                        let ncols = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+                        let mut row = Vec::new();
+                        let mut i = 2;
+                        for _ in 0..ncols {
+                            if i + 4 <= payload.len() {
+                                let vlen = i32::from_be_bytes(payload[i..i + 4].try_into().unwrap());
+                                i += 4;
+                                if vlen >= 0 {
+                                    let vlen = vlen as usize;
+                                    if i + vlen <= payload.len() {
+                                        row.push(Some(payload[i..i + vlen].to_vec()));
+                                        i += vlen;
+                                    } else {
+                                        row.push(None);
+                                    }
+                                } else {
+                                    row.push(None);
+                                }
+                            }
+                        }
+                        data_rows.push(row);
+                    }
+                }
+                b'E' => {
+                    let msg_start = payload.iter().position(|&b| b == b'M').unwrap_or(0) + 1;
+                    let msg_end = payload[msg_start..]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(payload.len().saturating_sub(msg_start));
+                    error_msg = Some(
+                        String::from_utf8_lossy(&payload[msg_start..msg_start + msg_end]).to_string(),
+                    );
+                }
+                b'C' => {
+                    let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+                    cmd_tag = Some(String::from_utf8_lossy(&payload[..end]).to_string());
+                }
+                b'Z' => {
+                    if !payload.is_empty() {
+                        ready_state = payload[0];
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+        (data_rows, error_msg, cmd_tag, ready_state)
+    }
+
     #[tokio::test]
     async fn query_roundtrip() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -670,19 +1078,306 @@ mod tests {
         assert_eq!(ready_type, b'Z');
 
         let sql = "CREATE TABLE t (id INT);";
-        let mut query = Vec::new();
-        query.push(b'Q');
-        let mut payload = Vec::new();
-        payload.extend_from_slice(sql.as_bytes());
-        payload.push(0);
-        let len = (payload.len() + 4) as i32;
-        query.extend_from_slice(&len.to_be_bytes());
-        query.extend_from_slice(&payload);
-        client.write_all(&query).await.expect("query");
+        send_query(&mut client, sql).await;
 
         let _ = read_message_type(&mut client).await;
         let ready_type = read_message_type(&mut client).await;
         assert_eq!(ready_type, b'Z');
+    }
+
+    #[tokio::test]
+    async fn integration_create_insert_select_and_transaction_commands() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_client(server, router, None, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+
+        send_query(&mut client, "CREATE TABLE t (id INT, name TEXT);").await;
+        let (_rows, err, tag, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "CREATE failed: {:?}", err);
+        assert!(tag.as_deref().map(|t| t.starts_with("OK")).unwrap_or(false));
+
+        send_query(&mut client, "INSERT INTO t (id, name) VALUES (1, 'alice');").await;
+        let (_rows, err, tag, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "INSERT failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("OK 1"));
+
+        send_query(&mut client, "SELECT * FROM t;").await;
+        let (rows, err, _tag, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "SELECT failed: {:?}", err);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(
+            rows[0][0].as_ref().map(|v| String::from_utf8_lossy(v).to_string()),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            rows[0][1].as_ref().map(|v| String::from_utf8_lossy(v).to_string()),
+            Some("alice".to_string())
+        );
+
+        send_query(&mut client, "BEGIN;").await;
+        let (_rows, err, tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "BEGIN failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("BEGIN"));
+        assert_eq!(ready_state, b'T', "ReadyForQuery should be InTransaction after BEGIN");
+
+        send_query(&mut client, "COMMIT;").await;
+        let (_rows, err, tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "COMMIT failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("COMMIT"));
+        assert_eq!(ready_state, b'I', "ReadyForQuery should be Idle after COMMIT");
+    }
+
+    #[tokio::test]
+    async fn transaction_state_rollback() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_client(server, router, None, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+
+        send_query(&mut client, "BEGIN;").await;
+        let (_rows, err, tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "BEGIN failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("BEGIN"));
+        assert_eq!(ready_state, b'T');
+
+        send_query(&mut client, "ROLLBACK;").await;
+        let (_rows, err, tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "ROLLBACK failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("ROLLBACK"));
+        assert_eq!(ready_state, b'I', "ReadyForQuery should be Idle after ROLLBACK");
+    }
+
+    #[tokio::test]
+    async fn transaction_state_mixed_with_dml() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_client(server, router, None, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+
+        send_query(&mut client, "CREATE TABLE tx_test (id INT);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "CREATE failed: {:?}", err);
+
+        send_query(&mut client, "BEGIN; INSERT INTO tx_test VALUES (1); COMMIT;").await;
+        let (_rows, err, tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "mixed batch failed: {:?}", err);
+        assert_eq!(ready_state, b'I');
+        assert_eq!(tag.as_deref(), Some("COMMIT"), "last CommandComplete in batch");
+    }
+
+    #[tokio::test]
+    async fn transaction_buffering_select_before_commit_does_not_see_row() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_client(server, router, None, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+
+        send_query(&mut client, "CREATE TABLE tx_vis (id INT);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "CREATE failed: {:?}", err);
+
+        send_query(&mut client, "BEGIN;").await;
+        let (_rows, err, tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "BEGIN failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("BEGIN"));
+        assert_eq!(ready_state, b'T');
+
+        send_query(&mut client, "INSERT INTO tx_vis VALUES (1);").await;
+        let (_rows, err, tag, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "INSERT failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("OK 1"));
+
+        send_query(&mut client, "SELECT * FROM tx_vis;").await;
+        let (rows, err, _tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "SELECT failed: {:?}", err);
+        assert_eq!(ready_state, b'T', "still in transaction");
+        assert_eq!(rows.len(), 0, "SELECT during transaction should not see uncommitted row");
+
+        send_query(&mut client, "COMMIT;").await;
+        let (_rows, err, tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "COMMIT failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("COMMIT"));
+        assert_eq!(ready_state, b'I');
+
+        send_query(&mut client, "SELECT * FROM tx_vis;").await;
+        let (rows, err, _tag, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "SELECT failed: {:?}", err);
+        assert_eq!(rows.len(), 1, "SELECT after COMMIT should see committed row");
+        assert_eq!(
+            rows[0][0].as_ref().map(|v| String::from_utf8_lossy(v).to_string()),
+            Some("1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_rollback_discards_buffered_insert() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_client(server, router, None, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+
+        send_query(&mut client, "CREATE TABLE tx_roll (id INT);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "CREATE failed: {:?}", err);
+
+        send_query(&mut client, "BEGIN;").await;
+        let (_rows, err, _, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "BEGIN failed: {:?}", err);
+        assert_eq!(ready_state, b'T');
+
+        send_query(&mut client, "INSERT INTO tx_roll VALUES (1);").await;
+        let (_rows, err, tag, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "INSERT failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("OK 1"));
+
+        send_query(&mut client, "ROLLBACK;").await;
+        let (_rows, err, tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "ROLLBACK failed: {:?}", err);
+        assert_eq!(tag.as_deref(), Some("ROLLBACK"));
+        assert_eq!(ready_state, b'I');
+
+        send_query(&mut client, "SELECT * FROM tx_roll;").await;
+        let (rows, err, _tag, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "SELECT failed: {:?}", err);
+        assert_eq!(rows.len(), 0, "SELECT after ROLLBACK should not see discarded row");
+    }
+
+    #[tokio::test]
+    async fn integration_joins_and_aggregates_via_simple_query() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_client(server, router, None, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+
+        send_query(&mut client, "CREATE TABLE orders (id INT, user_id INT, amount INT);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "CREATE orders failed: {:?}", err);
+
+        send_query(&mut client, "CREATE TABLE users (id INT, name TEXT);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "CREATE users failed: {:?}", err);
+
+        send_query(&mut client, "INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob');").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "INSERT users failed: {:?}", err);
+
+        send_query(&mut client, "INSERT INTO orders (id, user_id, amount) VALUES (1, 1, 100), (2, 2, 200), (3, 1, 50);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "INSERT orders failed: {:?}", err);
+
+        send_query(&mut client, "SELECT orders.id, users.name, orders.amount FROM orders INNER JOIN users ON orders.user_id = users.id;").await;
+        let (rows, err, _tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "SELECT join failed: {:?}", err);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(ready_state, b'I');
+        assert_eq!(rows[0][1].as_ref().map(|v| String::from_utf8_lossy(v).to_string()), Some("alice".to_string()));
+        assert_eq!(rows[0][2].as_ref().map(|v| String::from_utf8_lossy(v).to_string()), Some("100".to_string()));
+
+        send_query(&mut client, "SELECT COUNT(*), SUM(orders.amount) FROM orders INNER JOIN users ON orders.user_id = users.id;").await;
+        let (rows, err, _tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "SELECT join+aggregate failed: {:?}", err);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(ready_state, b'I');
+        assert_eq!(rows[0][0].as_ref().map(|v| String::from_utf8_lossy(v).to_string()), Some("3".to_string()));
+        assert_eq!(rows[0][1].as_ref().map(|v| String::from_utf8_lossy(v).to_string()), Some("350".to_string()));
     }
 
     #[tokio::test]
@@ -701,5 +1396,208 @@ mod tests {
         router.failover.mark_unhealthy(&leader_node.node_id);
         let next = router.select_leader(group);
         assert_ne!(leader, next);
+    }
+
+    #[tokio::test]
+    async fn extended_query_parse_bind_execute_sync_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_client(server, router, None, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+
+        send_query(&mut client, "CREATE TABLE extq (id INT, name TEXT);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "CREATE failed: {:?}", err);
+
+        send_query(&mut client, "INSERT INTO extq (id, name) VALUES (1, 'alice');").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "INSERT failed: {:?}", err);
+
+        let mut parse_payload = Vec::new();
+        parse_payload.extend_from_slice(b"stmt1\0");
+        parse_payload.extend_from_slice(b"SELECT * FROM extq;\0");
+        parse_payload.extend_from_slice(&0i16.to_be_bytes());
+        send_frontend_msg(&mut client, b'P', &parse_payload).await;
+        let typ = read_message_type(&mut client).await;
+        assert_eq!(typ, b'1');
+
+        let mut describe_stmt_payload = Vec::new();
+        describe_stmt_payload.push(b'S');
+        describe_stmt_payload.extend_from_slice(b"stmt1\0");
+        send_frontend_msg(&mut client, b'D', &describe_stmt_payload).await;
+        let typ = read_message_type(&mut client).await;
+        assert_eq!(typ, b'T', "Describe statement for SELECT should return RowDescription");
+
+        let mut bind_payload = Vec::new();
+        bind_payload.extend_from_slice(b"\0");
+        bind_payload.extend_from_slice(b"stmt1\0");
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        send_frontend_msg(&mut client, b'B', &bind_payload).await;
+        let typ = read_message_type(&mut client).await;
+        assert_eq!(typ, b'2');
+
+        let mut describe_payload = Vec::new();
+        describe_payload.push(b'P');
+        describe_payload.extend_from_slice(b"\0");
+        send_frontend_msg(&mut client, b'D', &describe_payload).await;
+        let typ = read_message_type(&mut client).await;
+        assert_eq!(typ, b'T', "Describe portal for SELECT should return RowDescription");
+
+        let mut execute_payload = Vec::new();
+        execute_payload.extend_from_slice(b"\0");
+        execute_payload.extend_from_slice(&0i32.to_be_bytes());
+        send_frontend_msg(&mut client, b'E', &execute_payload).await;
+
+        send_frontend_msg(&mut client, b'S', &[]).await;
+        let (rows, err, _tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "Execute failed: {:?}", err);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(ready_state, b'I');
+    }
+
+    #[tokio::test]
+    async fn extended_query_execute_max_rows_truncates() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_client(server, router, None, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+
+        send_query(&mut client, "CREATE TABLE maxrows_test (id INT);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "CREATE failed: {:?}", err);
+
+        send_query(&mut client, "INSERT INTO maxrows_test VALUES (1),(2),(3),(4),(5);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "INSERT failed: {:?}", err);
+
+        let mut parse_payload = Vec::new();
+        parse_payload.extend_from_slice(b"\0");
+        parse_payload.extend_from_slice(b"SELECT * FROM maxrows_test;\0");
+        parse_payload.extend_from_slice(&0i16.to_be_bytes());
+        send_frontend_msg(&mut client, b'P', &parse_payload).await;
+        let _ = read_message_type(&mut client).await;
+
+        let mut bind_payload = Vec::new();
+        bind_payload.extend_from_slice(b"\0");
+        bind_payload.extend_from_slice(b"\0");
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        send_frontend_msg(&mut client, b'B', &bind_payload).await;
+        let _ = read_message_type(&mut client).await;
+
+        let mut execute_payload = Vec::new();
+        execute_payload.extend_from_slice(b"\0");
+        execute_payload.extend_from_slice(&2i32.to_be_bytes());
+        send_frontend_msg(&mut client, b'E', &execute_payload).await;
+
+        send_frontend_msg(&mut client, b'S', &[]).await;
+        let (rows, err, _tag, ready_state) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "Execute failed: {:?}", err);
+        assert_eq!(rows.len(), 2, "max_rows=2 should truncate to 2 rows");
+        assert_eq!(ready_state, b'I');
+    }
+
+    #[tokio::test]
+    async fn extended_query_close_portal_and_statement() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = test_config(dir.path().to_string_lossy().as_ref());
+        let router = ShardRouter::new(&config).await.expect("router");
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            handle_client(server, router, None, None).await;
+        });
+
+        let params = b"user\0test\0\0";
+        let len = (params.len() + 8) as i32;
+        let protocol = 196608i32;
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&len.to_be_bytes());
+        startup.extend_from_slice(&protocol.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.expect("startup");
+
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+        let _ = read_message_type(&mut client).await;
+
+        send_query(&mut client, "CREATE TABLE close_test (id INT);").await;
+        let (_rows, err, _, _) = read_until_ready(&mut client).await;
+        assert!(err.is_none(), "CREATE failed: {:?}", err);
+
+        let mut parse_payload = Vec::new();
+        parse_payload.extend_from_slice(b"mystmt\0");
+        parse_payload.extend_from_slice(b"SELECT * FROM close_test;\0");
+        parse_payload.extend_from_slice(&0i16.to_be_bytes());
+        send_frontend_msg(&mut client, b'P', &parse_payload).await;
+        let typ = read_message_type(&mut client).await;
+        assert_eq!(typ, b'1');
+
+        let mut bind_payload = Vec::new();
+        bind_payload.extend_from_slice(b"myportal\0");
+        bind_payload.extend_from_slice(b"mystmt\0");
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        send_frontend_msg(&mut client, b'B', &bind_payload).await;
+        let typ = read_message_type(&mut client).await;
+        assert_eq!(typ, b'2');
+
+        let mut close_portal_payload = Vec::new();
+        close_portal_payload.push(b'P');
+        close_portal_payload.extend_from_slice(b"myportal\0");
+        send_frontend_msg(&mut client, b'C', &close_portal_payload).await;
+        let typ = read_message_type(&mut client).await;
+        assert_eq!(typ, b'3', "Close portal should return CloseComplete");
+
+        let mut execute_payload = Vec::new();
+        execute_payload.extend_from_slice(b"myportal\0");
+        execute_payload.extend_from_slice(&0i32.to_be_bytes());
+        send_frontend_msg(&mut client, b'E', &execute_payload).await;
+        send_frontend_msg(&mut client, b'S', &[]).await;
+        let (_rows, err, _tag, _) = read_until_ready(&mut client).await;
+        assert!(err.is_some(), "Execute on closed portal should fail");
+        assert!(err.unwrap().contains("unknown portal"));
+
+        let mut close_stmt_payload = Vec::new();
+        close_stmt_payload.push(b'S');
+        close_stmt_payload.extend_from_slice(b"mystmt\0");
+        send_frontend_msg(&mut client, b'C', &close_stmt_payload).await;
+        let typ = read_message_type(&mut client).await;
+        assert_eq!(typ, b'3', "Close statement should return CloseComplete");
     }
 }

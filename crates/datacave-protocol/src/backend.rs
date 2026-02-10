@@ -30,10 +30,22 @@ pub async fn write_message<S: AsyncWrite + Unpin>(stream: &mut S, msg: BackendMe
             buf.put_i32(pid);
             buf.put_i32(secret);
         }
-        BackendMessage::ReadyForQuery => {
+        BackendMessage::ReadyForQuery { state } => {
             buf.put_u8(b'Z');
             buf.put_i32(5);
-            buf.put_u8(b'I');
+            buf.put_u8(state.wire_byte());
+        }
+        BackendMessage::ParseComplete => {
+            buf.put_u8(b'1');
+            buf.put_i32(4);
+        }
+        BackendMessage::BindComplete => {
+            buf.put_u8(b'2');
+            buf.put_i32(4);
+        }
+        BackendMessage::NoData => {
+            buf.put_u8(b'n');
+            buf.put_i32(4);
         }
         BackendMessage::RowDescription { fields } => {
             let mut payload = BytesMut::new();
@@ -82,6 +94,10 @@ pub async fn write_message<S: AsyncWrite + Unpin>(stream: &mut S, msg: BackendMe
             buf.put_u8(b'E');
             buf.put_i32((payload.len() + 4) as i32);
             buf.extend_from_slice(&payload);
+        }
+        BackendMessage::CloseComplete => {
+            buf.put_u8(b'3');
+            buf.put_i32(4);
         }
     }
     stream.write_all(&buf).await?;

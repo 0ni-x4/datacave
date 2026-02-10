@@ -1,5 +1,9 @@
 use datacave_core::types::{Column, DataValue};
-use sqlparser::ast::{Expr, ObjectName, Statement, TableConstraint, TableFactor, Value, FromTable, TableWithJoins};
+use sqlparser::ast::{
+    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint,
+    JoinOperator, ObjectName, Statement, TableConstraint, TableFactor, Value, FromTable,
+    TableWithJoins,
+};
 
 #[derive(Debug, Clone)]
 pub enum Plan {
@@ -8,6 +12,9 @@ pub enum Plan {
     Select(SelectPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
+    Begin(BeginPlan),
+    Commit(CommitPlan),
+    Rollback(RollbackPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -25,9 +32,35 @@ pub struct InsertPlan {
 }
 
 #[derive(Debug, Clone)]
+pub enum ProjectionItem {
+    Column(String),
+    Aggregate(AggregateFunc, Option<String>),
+    AllColumns,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinSpec {
+    pub right_table: String,
+    pub left_column: String,
+    pub right_column: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct SelectPlan {
     pub table: String,
-    pub projection: Vec<String>,
+    pub joins: Vec<JoinSpec>,
+    pub projection: Vec<ProjectionItem>,
+    /// Column names for GROUP BY (empty when no GROUP BY)
+    pub group_by: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +73,15 @@ pub struct UpdatePlan {
 pub struct DeletePlan {
     pub table: String,
 }
+
+#[derive(Debug, Clone)]
+pub struct BeginPlan {}
+
+#[derive(Debug, Clone)]
+pub struct CommitPlan {}
+
+#[derive(Debug, Clone)]
+pub struct RollbackPlan {}
 
 pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
     match stmt {
@@ -91,22 +133,26 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
         }
         Statement::Query(query) => {
             if let sqlparser::ast::SetExpr::Select(select) = &*query.body {
-                let table = match select.from.first() {
-                    Some(rel) => match &rel.relation {
-                        TableFactor::Table { name, .. } => object_name(name),
-                        _ => return None,
-                    },
-                    None => return None,
+                let first_rel = select.from.first()?;
+                let table = match &first_rel.relation {
+                    TableFactor::Table { name, .. } => object_name(name),
+                    _ => return None,
                 };
-                let projection = select
-                    .projection
-                    .iter()
-                    .map(|item| item.to_string())
-                    .collect();
-                return Some(Plan::Select(SelectPlan { table, projection }));
+                let projection = plan_projection(&select.projection)?;
+                let joins = plan_joins(first_rel)?;
+                let group_by = plan_group_by(&select.group_by)?;
+                return Some(Plan::Select(SelectPlan {
+                    table,
+                    joins,
+                    projection,
+                    group_by,
+                }));
             }
             None
         }
+        Statement::StartTransaction { .. } => Some(Plan::Begin(BeginPlan {})),
+        Statement::Commit { .. } => Some(Plan::Commit(CommitPlan {})),
+        Statement::Rollback { .. } => Some(Plan::Rollback(RollbackPlan {})),
         Statement::Update { table, assignments, .. } => {
             let table = match &table.relation {
                 TableFactor::Table { name, .. } => object_name(name),
@@ -128,6 +174,174 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
                     _ => None,
                 })?;
             Some(Plan::Delete(DeletePlan { table }))
+        }
+        _ => None,
+    }
+}
+
+fn plan_projection(
+    items: &[sqlparser::ast::SelectItem],
+) -> Option<Vec<ProjectionItem>> {
+    let mut out = Vec::new();
+    for item in items {
+        let proj = match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(expr) => match expr {
+                Expr::Function(func) => {
+                    let agg = parse_aggregate_func(&func)?;
+                    Some(ProjectionItem::Aggregate(agg.0, agg.1))
+                }
+                Expr::Identifier(ident) => {
+                    Some(ProjectionItem::Column(ident.value.clone()))
+                }
+                Expr::CompoundIdentifier(parts) => {
+                    let name = parts
+                        .last()
+                        .map(|p| p.value.clone())
+                        .unwrap_or_else(|| parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>().join("."));
+                    Some(ProjectionItem::Column(name))
+                }
+                Expr::Wildcard => Some(ProjectionItem::AllColumns),
+                _ => Some(ProjectionItem::Column(expr.to_string())),
+            },
+            sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => match &*expr {
+                Expr::Function(func) => {
+                    let agg = parse_aggregate_func(&func)?;
+                    Some(ProjectionItem::Aggregate(agg.0, agg.1))
+                }
+                Expr::Identifier(ident) => {
+                    Some(ProjectionItem::Column(ident.value.clone()))
+                }
+                _ => Some(ProjectionItem::Column(expr.to_string())),
+            },
+            sqlparser::ast::SelectItem::Wildcard(_) => Some(ProjectionItem::AllColumns),
+            sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => Some(ProjectionItem::AllColumns),
+        };
+        if let Some(p) = proj {
+            out.push(p);
+        }
+    }
+    Some(out)
+}
+
+fn parse_aggregate_func(func: &Function) -> Option<(AggregateFunc, Option<String>)> {
+    let name = func.name.0.first()?.value.to_uppercase();
+    let arg = func.args.first().and_then(|a| match a {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
+            Some(ident.value.clone())
+        }
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
+            parts.last().map(|p| p.value.clone())
+        }
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
+        FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => None,
+        _ => None,
+    });
+    let agg = match name.as_str() {
+        "COUNT" => AggregateFunc::Count,
+        "SUM" => AggregateFunc::Sum,
+        "AVG" => AggregateFunc::Avg,
+        "MIN" => AggregateFunc::Min,
+        "MAX" => AggregateFunc::Max,
+        _ => return None,
+    };
+    Some((agg, arg))
+}
+
+fn plan_group_by(group_by: &GroupByExpr) -> Option<Vec<String>> {
+    match group_by {
+        GroupByExpr::All => None, // GROUP BY ALL not supported
+        GroupByExpr::Expressions(exprs) => {
+            let mut cols = Vec::new();
+            for expr in exprs {
+                let col = match expr {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    Expr::CompoundIdentifier(parts) => {
+                        parts.last()?.value.clone()
+                    }
+                    _ => return None,
+                };
+                cols.push(col);
+            }
+            Some(cols)
+        }
+    }
+}
+
+fn plan_joins(rel: &TableWithJoins) -> Option<Vec<JoinSpec>> {
+    let left_table = match &rel.relation {
+        TableFactor::Table { name, .. } => object_name(name),
+        _ => return None,
+    };
+    let mut joins = Vec::new();
+    let mut current_left = left_table;
+    for join in &rel.joins {
+        let JoinOperator::Inner(constraint) = &join.join_operator else {
+            return None;
+        };
+        let right_table = match &join.relation {
+            TableFactor::Table { name, .. } => object_name(name),
+            _ => return None,
+        };
+        let (left_col, right_col) = match constraint {
+            JoinConstraint::On(expr) => {
+                extract_equality_columns(expr, &current_left, &right_table)?
+            }
+            JoinConstraint::Using(names) => {
+                let col = names.first()?.value.clone();
+                (col.clone(), col)
+            }
+            JoinConstraint::Natural | JoinConstraint::None => return None,
+        };
+        joins.push(JoinSpec {
+            right_table: right_table.clone(),
+            left_column: left_col,
+            right_column: right_col,
+        });
+        current_left = format!("{}_join_{}", current_left, right_table);
+    }
+    Some(joins)
+}
+
+fn extract_equality_columns(
+    expr: &Expr,
+    left_table: &str,
+    right_table: &str,
+) -> Option<(String, String)> {
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    {
+        let (l_col, l_tbl) = expr_to_column_and_table(left)?;
+        let (r_col, r_tbl) = expr_to_column_and_table(right)?;
+        let left_tbl_simple = left_table.split('.').last().unwrap_or(left_table);
+        let right_tbl_simple = right_table.split('.').last().unwrap_or(right_table);
+        if l_tbl == left_tbl_simple && r_tbl == right_tbl_simple {
+            Some((l_col, r_col))
+        } else if l_tbl == right_tbl_simple && r_tbl == left_tbl_simple {
+            Some((r_col, l_col))
+        } else if l_tbl.is_empty() && r_tbl.is_empty() {
+            Some((l_col, r_col))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn expr_to_column_and_table(expr: &Expr) -> Option<(String, String)> {
+    match expr {
+        Expr::Identifier(ident) => Some((ident.value.clone(), String::new())),
+        Expr::CompoundIdentifier(parts) => {
+            let col = parts.last()?.value.clone();
+            let tbl = if parts.len() > 1 {
+                parts.first()?.value.clone()
+            } else {
+                String::new()
+            };
+            Some((col, tbl))
         }
         _ => None,
     }

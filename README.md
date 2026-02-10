@@ -68,17 +68,26 @@ cargo run -p datacave-server -- gen-password-hash --password "change-me"
 
 ## SQL Compatibility Matrix
 
-Supported today:
-- `CREATE TABLE`
-- `INSERT`
-- `SELECT`
-- `UPDATE`
-- `DELETE`
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `CREATE TABLE` | Supported | Single table, basic column types |
+| `INSERT` | Supported | Values list; single-table only |
+| `SELECT` | Supported | Single-table or INNER JOIN |
+| `UPDATE` | Supported | Single-table, no subqueries |
+| `DELETE` | Supported | Single-table, no subqueries |
+| INNER JOIN | Supported | Single join; `ON col1 = col2` or `USING (col)` |
+| Aggregations (COUNT, SUM, AVG, MIN, MAX) | Supported | On single-table or joined result |
+| `BEGIN` / `COMMIT` / `ROLLBACK` | Accepted (no-op) | Wire-accepted; no multi-statement atomicity |
+| Subqueries | Not supported | Planned |
+| Indexes | Not supported | Planned |
 
-Not yet supported:
-- Joins
-- Aggregations
-- Transactions
+See [COMPATIBILITY_MATRIX.md](./COMPATIBILITY_MATRIX.md) for detailed semantics.
+
+### Explicit Limitations
+
+- **LEFT/RIGHT/FULL OUTER JOIN**: Not supported; INNER JOIN only.
+- **Transaction commands accepted but no-op**: `BEGIN`/`COMMIT`/`ROLLBACK` are accepted and return success; no multi-statement atomicity or isolation.
+- **PostgreSQL wire protocol (client compatibility)**: Clients use standard Postgres protocol; server implementation is Datacave-only (no Postgres engine dependency).
 
 ## Development
 
