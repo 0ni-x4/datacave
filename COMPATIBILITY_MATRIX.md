@@ -17,20 +17,20 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 | Feature | Status | Implementation Notes |
 |---------|--------|------------------------|
 | `INSERT` | Supported | Values list; single-table only. Column list optional; values aligned by schema or position. |
-| `SELECT` | Supported | Single-table projection, `*`, qualified column names. |
-| `UPDATE` | Supported | Single-table assignments; no subqueries, no `WHERE`. |
-| `DELETE` | Supported | Single-table; no `WHERE` (deletes all visible rows). |
+| `SELECT` | Supported | Single-table projection, `*`, qualified column names. No WHERE filtering. ORDER BY, LIMIT, OFFSET supported. |
+| `UPDATE` | Supported | Single-table assignments; no WHERE (updates all visible rows). |
+| `DELETE` | Supported | Single-table; no WHERE (deletes all visible rows). |
 
 ### Joins
 
 | Feature | Status | Implementation Notes |
 |---------|--------|------------------------|
-| `INNER JOIN` | Supported | Single join between two tables. Equality `ON col1 = col2` or `USING (col)`. |
+| `INNER JOIN` | Supported | Two-table only. Equality `ON col1 = col2` or `USING (col)`. Executor uses first join only. |
 | `LEFT JOIN` | Not supported | Planner returns `None` for non-inner joins. |
 | `RIGHT JOIN` | Not supported | Planner returns `None`. |
 | `FULL OUTER JOIN` | Not supported | Planner returns `None`. |
 | `CROSS JOIN` | Not supported | Planner returns `None`. |
-| Multi-table joins | Not supported | Planner supports only one join. |
+| Multi-table (3+) joins | Not supported | Planner rejects; extract_equality_columns fails for chained joins. |
 
 ### Aggregations
 
@@ -42,8 +42,8 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 | `AVG(col)` | Supported | Returns `Float64`. |
 | `MIN(col)` | Supported | Returns `Float64` for numeric; nulls excluded. |
 | `MAX(col)` | Supported | Returns `Float64` for numeric; nulls excluded. |
-| `GROUP BY` | Not supported | All rows treated as one group. |
-| `HAVING` | Not supported | Planned. |
+| `GROUP BY` | Supported | Single-table and join+aggregate. `GROUP BY ALL` not supported. |
+| `HAVING` | Partial | Only with GROUP BY. Column/alias or literal operands; `=`, `!=`, `<`, `<=`, `>`, `>=`. Aggregate expressions (e.g. `HAVING COUNT(*) > 2`) not supported. |
 
 ### Aggregates on Joined Rows
 
@@ -52,13 +52,21 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 | `SELECT COUNT(*) FROM t1 JOIN t2 ON ...` | Supported | Join executed first; aggregates computed on joined result. |
 | `SELECT SUM(col) FROM t1 JOIN t2 ON ...` | Supported | Same as above. |
 
+### Ordering and Pagination
+
+| Feature | Status | Implementation Notes |
+|---------|--------|------------------------|
+| `ORDER BY` | Supported | Column name, qualified column, or 1-based position. ASC/DESC. |
+| `LIMIT` | Supported | Numeric literal only. |
+| `OFFSET` | Supported | Numeric literal only. |
+
 ### Transaction Control
 
 | Feature | Status | Implementation Notes |
 |---------|--------|------------------------|
-| `BEGIN` / `START TRANSACTION` | Accepted (no-op) | Wire-accepted; returns `BEGIN` tag; ReadyForQuery `InTransaction`. |
-| `COMMIT` | Accepted (no-op) | Returns `COMMIT` tag; ReadyForQuery `Idle`. |
-| `ROLLBACK` | Accepted (no-op) | Returns `ROLLBACK` tag; ReadyForQuery `Idle`. |
+| `BEGIN` / `START TRANSACTION` | Accepted | Wire-accepted; returns `BEGIN` tag; ReadyForQuery `InTransaction`. Mutating statements buffered. |
+| `COMMIT` | Accepted | Executes buffered statements; ReadyForQuery `Idle`. |
+| `ROLLBACK` | Accepted | Discards buffer; ReadyForQuery `Idle`. |
 | Atomicity | Not implemented | No multi-statement atomicity or isolation. |
 
 ### Other SQL
@@ -66,9 +74,7 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 | Feature | Status | Implementation Notes |
 |---------|--------|------------------------|
 | Subqueries | Not supported | Planned (IN, EXISTS, scalar). |
-| `WHERE` | Not supported | Planned. |
-| `ORDER BY` | Not supported | Planned. |
-| `LIMIT` / `OFFSET` | Not supported | Planned. |
+| `WHERE` | Not supported | SELECT, UPDATE, DELETE ignore WHERE. |
 
 ## Wire Protocol
 
@@ -84,9 +90,10 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 | ReadyForQuery | Server→Client | Supported | `I` (Idle), `T` (Transaction), `E` (Error). |
 | Query (Q) | Client→Server | Supported | Simple query. |
 | Parse (P) | Client→Server | Supported | Statement name + query. |
-| Bind (B) | Client→Server | Supported | Portal + statement; 0 param format codes. |
+| Bind (B) | Client→Server | Supported | Portal + statement; param substitution for $1, $2, ?. |
 | Execute (E) | Client→Server | Supported | Portal + max_rows. |
 | Sync (S) | Client→Server | Supported | Flushes extended-query pipeline. |
+| Flush (H) | Client→Server | Supported | Request to flush output buffer; no-op (unbuffered). |
 | Describe (D) | Client→Server | Supported | Statement or Portal; returns NoData. |
 | ParseComplete (1) | Server→Client | Supported | After Parse. |
 | BindComplete (2) | Server→Client | Supported | After Bind. |
@@ -95,6 +102,8 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 | CommandComplete (C) | Server→Client | Supported | Tag: OK, OK N, SELECT N, BEGIN, COMMIT, ROLLBACK. |
 | ErrorResponse (E) | Server→Client | Supported | On error. |
 | NoData (n) | Server→Client | Supported | For Describe on non-SELECT. |
+| Close (C) | Client→Server | Supported | Statement or Portal. |
+| CloseComplete (3) | Server→Client | Supported | After Close. |
 | Terminate (X) | Client→Server | Supported | Closes connection. |
 
 ### Extended Query Flow

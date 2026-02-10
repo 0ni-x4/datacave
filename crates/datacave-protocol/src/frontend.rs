@@ -157,6 +157,7 @@ pub async fn read_message<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Fronte
         b'D' => parse_describe(&buf),
         b'E' => parse_execute(&buf),
         b'S' => Ok(FrontendMessage::Sync),
+        b'H' => Ok(FrontendMessage::Flush),
         b'C' => parse_close(&buf),
         other => Ok(FrontendMessage::Unsupported { code: other }),
     }

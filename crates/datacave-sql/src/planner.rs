@@ -2,7 +2,7 @@ use datacave_core::types::{Column, DataValue};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint,
     JoinOperator, ObjectName, Statement, TableConstraint, TableFactor, Value, FromTable,
-    TableWithJoins,
+    TableWithJoins, OrderByExpr,
 };
 
 #[derive(Debug, Clone)]
@@ -33,9 +33,47 @@ pub struct InsertPlan {
 
 #[derive(Debug, Clone)]
 pub enum ProjectionItem {
-    Column(String),
-    Aggregate(AggregateFunc, Option<String>),
+    Column(String, Option<String>), // (name, output_alias)
+    Aggregate(AggregateFunc, Option<String>, Option<String>), // (func, arg_col, alias)
     AllColumns,
+}
+
+/// Ordering specification: column/alias name or 1-based position, with asc (true=ASC, false=DESC).
+#[derive(Debug, Clone)]
+pub struct OrderBySpec {
+    pub spec: OrderBySpecKind,
+    pub asc: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum OrderBySpecKind {
+    ColumnOrAlias(String),
+    Position(usize),
+}
+
+/// HAVING condition operand: column/alias, literal, or aggregate expression.
+#[derive(Debug, Clone)]
+pub enum HavingOperand {
+    ColumnOrAlias(String),
+    Literal(DataValue),
+    Aggregate(AggregateFunc, Option<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HavingOp {
+    Eq,
+    NotEq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+#[derive(Debug, Clone)]
+pub struct HavingCond {
+    pub left: HavingOperand,
+    pub op: HavingOp,
+    pub right: HavingOperand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +99,11 @@ pub struct SelectPlan {
     pub projection: Vec<ProjectionItem>,
     /// Column names for GROUP BY (empty when no GROUP BY)
     pub group_by: Vec<String>,
+    /// HAVING condition (only when GROUP BY present)
+    pub having: Option<HavingCond>,
+    pub order_by: Vec<OrderBySpec>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,11 +184,19 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
                 let projection = plan_projection(&select.projection)?;
                 let joins = plan_joins(first_rel)?;
                 let group_by = plan_group_by(&select.group_by)?;
+                let having = plan_having(select.having.as_ref())?;
+                let order_by = plan_order_by(&query.order_by)?;
+                let limit = plan_limit(query.limit.as_ref())?;
+                let offset = plan_offset(query.offset.as_ref())?;
                 return Some(Plan::Select(SelectPlan {
                     table,
                     joins,
                     projection,
                     group_by,
+                    having,
+                    order_by,
+                    limit,
+                    offset,
                 }));
             }
             None
@@ -188,31 +239,34 @@ fn plan_projection(
             sqlparser::ast::SelectItem::UnnamedExpr(expr) => match expr {
                 Expr::Function(func) => {
                     let agg = parse_aggregate_func(&func)?;
-                    Some(ProjectionItem::Aggregate(agg.0, agg.1))
+                    Some(ProjectionItem::Aggregate(agg.0, agg.1, None))
                 }
                 Expr::Identifier(ident) => {
-                    Some(ProjectionItem::Column(ident.value.clone()))
+                    Some(ProjectionItem::Column(ident.value.clone(), None))
                 }
                 Expr::CompoundIdentifier(parts) => {
                     let name = parts
                         .last()
                         .map(|p| p.value.clone())
                         .unwrap_or_else(|| parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>().join("."));
-                    Some(ProjectionItem::Column(name))
+                    Some(ProjectionItem::Column(name, None))
                 }
                 Expr::Wildcard => Some(ProjectionItem::AllColumns),
-                _ => Some(ProjectionItem::Column(expr.to_string())),
+                _ => Some(ProjectionItem::Column(expr.to_string(), None)),
             },
-            sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => match &*expr {
-                Expr::Function(func) => {
-                    let agg = parse_aggregate_func(&func)?;
-                    Some(ProjectionItem::Aggregate(agg.0, agg.1))
+            sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
+                let alias_val = alias.value.clone();
+                match &*expr {
+                    Expr::Function(func) => {
+                        let agg = parse_aggregate_func(&func)?;
+                        Some(ProjectionItem::Aggregate(agg.0, agg.1, Some(alias_val)))
+                    }
+                    Expr::Identifier(ident) => {
+                        Some(ProjectionItem::Column(ident.value.clone(), Some(alias_val)))
+                    }
+                    _ => Some(ProjectionItem::Column(expr.to_string(), None)),
                 }
-                Expr::Identifier(ident) => {
-                    Some(ProjectionItem::Column(ident.value.clone()))
-                }
-                _ => Some(ProjectionItem::Column(expr.to_string())),
-            },
+            }
             sqlparser::ast::SelectItem::Wildcard(_) => Some(ProjectionItem::AllColumns),
             sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => Some(ProjectionItem::AllColumns),
         };
@@ -264,6 +318,103 @@ fn plan_group_by(group_by: &GroupByExpr) -> Option<Vec<String>> {
             }
             Some(cols)
         }
+    }
+}
+
+fn plan_having(having: Option<&Expr>) -> Option<Option<HavingCond>> {
+    let expr = match having {
+        None => return Some(None),
+        Some(e) => e,
+    };
+    let cond = parse_having_expr(expr)?;
+    Some(Some(cond))
+}
+
+fn parse_having_expr(expr: &Expr) -> Option<HavingCond> {
+    if let Expr::BinaryOp { left, op, right } = expr {
+        let op_enum = match op {
+            BinaryOperator::Eq => HavingOp::Eq,
+            BinaryOperator::NotEq => HavingOp::NotEq,
+            BinaryOperator::Gt => HavingOp::Gt,
+            BinaryOperator::GtEq => HavingOp::Gte,
+            BinaryOperator::Lt => HavingOp::Lt,
+            BinaryOperator::LtEq => HavingOp::Lte,
+            _ => return None,
+        };
+        let left_op = expr_to_having_operand(left)?;
+        let right_op = expr_to_having_operand(right)?;
+        Some(HavingCond {
+            left: left_op,
+            op: op_enum,
+            right: right_op,
+        })
+    } else {
+        None
+    }
+}
+
+fn expr_to_having_operand(expr: &Expr) -> Option<HavingOperand> {
+    match expr {
+        Expr::Identifier(ident) => Some(HavingOperand::ColumnOrAlias(ident.value.clone())),
+        Expr::CompoundIdentifier(parts) => {
+            parts.last().map(|p| HavingOperand::ColumnOrAlias(p.value.clone()))
+        }
+        Expr::Value(_v) => Some(HavingOperand::Literal(expr_to_value(expr))),
+        Expr::Function(func) => {
+            let (agg, arg) = parse_aggregate_func(func)?;
+            Some(HavingOperand::Aggregate(agg, arg))
+        }
+        _ => None,
+    }
+}
+
+fn plan_order_by(order_by: &[OrderByExpr]) -> Option<Vec<OrderBySpec>> {
+    let mut out = Vec::new();
+    for oe in order_by {
+        let spec_kind = match &oe.expr {
+            Expr::Identifier(ident) => OrderBySpecKind::ColumnOrAlias(ident.value.clone()),
+            Expr::CompoundIdentifier(parts) => {
+                OrderBySpecKind::ColumnOrAlias(parts.last()?.value.clone())
+            }
+            Expr::Value(Value::Number(n, _)) => {
+                let v: i64 = n.parse().ok()?;
+                if v >= 1 {
+                    OrderBySpecKind::Position(v as usize)
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let asc = oe.asc.unwrap_or(true);
+        out.push(OrderBySpec { spec: spec_kind, asc });
+    }
+    Some(out)
+}
+
+fn plan_limit(limit: Option<&Expr>) -> Option<Option<u64>> {
+    match limit {
+        None => Some(None),
+        Some(Expr::Value(Value::Number(n, _))) => {
+            let v: u64 = n.parse().ok()?;
+            Some(Some(v))
+        }
+        Some(Expr::Value(Value::SingleQuotedString(_))) => None,
+        _ => None,
+    }
+}
+
+fn plan_offset(offset: Option<&sqlparser::ast::Offset>) -> Option<Option<u64>> {
+    let off = match offset {
+        None => return Some(None),
+        Some(o) => o,
+    };
+    match &off.value {
+        Expr::Value(Value::Number(n, _)) => {
+            let v: u64 = n.parse().ok()?;
+            Some(Some(v))
+        }
+        _ => None,
     }
 }
 

@@ -70,23 +70,38 @@ cargo run -p datacave-server -- gen-password-hash --password "change-me"
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `CREATE TABLE` | Supported | Single table, basic column types |
+| `CREATE TABLE` | Supported | Single table, basic column types (INT, BIGINT, TEXT, BOOLEAN, FLOAT); PRIMARY KEY |
 | `INSERT` | Supported | Values list; single-table only |
-| `SELECT` | Supported | Single-table or INNER JOIN |
-| `UPDATE` | Supported | Single-table, no subqueries |
-| `DELETE` | Supported | Single-table, no subqueries |
-| INNER JOIN | Supported | Single join; `ON col1 = col2` or `USING (col)` |
-| Aggregations (COUNT, SUM, AVG, MIN, MAX) | Supported | On single-table or joined result |
-| `BEGIN` / `COMMIT` / `ROLLBACK` | Accepted (no-op) | Wire-accepted; no multi-statement atomicity |
+| `SELECT` | Supported | Single-table or INNER JOIN; no WHERE |
+| `UPDATE` | Supported | Single-table; no WHERE (updates all rows) |
+| `DELETE` | Supported | Single-table; no WHERE (deletes all rows) |
+| INNER JOIN | Supported | Two-table only; `ON col1 = col2` or `USING (col)` |
+| Aggregations (COUNT, SUM, AVG, MIN, MAX) | Supported | Single-table or joined result |
+| GROUP BY | Supported | Single-table or join+aggregate; `GROUP BY ALL` not supported |
+| ORDER BY | Supported | Column name or 1-based position; ASC/DESC |
+| LIMIT / OFFSET | Supported | Numeric literals only |
+| HAVING | Partial | Only with GROUP BY; column/alias vs literal; aggregate expressions (e.g. HAVING COUNT(*) > 2) not supported |
+| `BEGIN` / `COMMIT` / `ROLLBACK` | Accepted | Wire-accepted; mutating statements buffered until COMMIT; no isolation |
 | Subqueries | Not supported | Planned |
 | Indexes | Not supported | Planned |
 
 See [COMPATIBILITY_MATRIX.md](./COMPATIBILITY_MATRIX.md) for detailed semantics.
 
+## PostgreSQL Protocol Compatibility
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Startup / Authentication / ReadyForQuery | Supported | Includes cleartext password auth flow |
+| Simple Query (`Q`) | Supported | Multi-statement batches supported |
+| Extended Query (`Parse/Bind/Describe/Execute/Sync`) | Supported | Basic prepared statement + portal lifecycle |
+| `Flush` (`H`) | Supported | No-op in current implementation |
+| `Close` (`C`) | Supported | Portal and statement cleanup |
+
 ### Explicit Limitations
 
-- **LEFT/RIGHT/FULL OUTER JOIN**: Not supported; INNER JOIN only.
-- **Transaction commands accepted but no-op**: `BEGIN`/`COMMIT`/`ROLLBACK` are accepted and return success; no multi-statement atomicity or isolation.
+- **WHERE**: Not supported on SELECT, UPDATE, or DELETE.
+- **LEFT/RIGHT/FULL/CROSS JOIN**: Not supported; INNER JOIN only. Multi-table (3+) joins not supported.
+- **Transactions**: `BEGIN`/`COMMIT`/`ROLLBACK` accepted; mutating statements buffered until COMMIT; no guaranteed multi-statement atomicity or isolation.
 - **PostgreSQL wire protocol (client compatibility)**: Clients use standard Postgres protocol; server implementation is Datacave-only (no Postgres engine dependency).
 
 ## Development

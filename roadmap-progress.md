@@ -6,16 +6,17 @@ Tracks implemented vs pending parity blocks for Datacave.
 
 | Block | Status | Notes |
 |-------|--------|-------|
-| DDL: CREATE TABLE | Done | Basic schemas, column types |
+| DDL: CREATE TABLE | Done | Basic schemas, column types, PRIMARY KEY |
 | DDL: DROP TABLE | Pending | Parser accepts; planner/executor not wired |
 | DML: INSERT | Done | Values list |
-| DML: SELECT | Done | Single-table, simple projection |
-| DML: UPDATE | Done | Single-table assignments |
-| DML: DELETE | Done | Single-table |
-| Joins | Done | INNER JOIN only; ON col1=col2 or USING (col) |
-| Aggregations | Done | COUNT, SUM, AVG, MIN, MAX; no GROUP BY |
+| DML: SELECT | Done | Single-table, projection; no WHERE; ORDER BY, LIMIT, OFFSET |
+| DML: UPDATE | Done | Single-table; no WHERE (updates all) |
+| DML: DELETE | Done | Single-table; no WHERE (deletes all) |
+| Joins | Done | Two-table INNER JOIN; ON col1=col2 or USING (col) |
+| Aggregations | Done | COUNT, SUM, AVG, MIN, MAX; GROUP BY; HAVING (column/literal only, no agg expr) |
+| ORDER BY / LIMIT / OFFSET | Done | Column/position; numeric literals only |
 | Subqueries | Pending | IN, EXISTS, scalar subqueries |
-| transactions (BEGIN/COMMIT/ROLLBACK) | Wire-accepted (no-op) | Server accepts; no multi-statement atomicity |
+| Transactions (BEGIN/COMMIT/ROLLBACK) | Done | Mutating stmts buffered until COMMIT; no isolation |
 | Indexes | Pending | CREATE INDEX, use in plans |
 
 ## Protocol Parity
@@ -24,9 +25,9 @@ Tracks implemented vs pending parity blocks for Datacave.
 |-------|--------|-------|
 | Startup / auth cleartext | Done | |
 | Simple query (Q) | Done | |
-| Extended query (Parse/Bind/Execute/Sync) | Done | Prepared statements, portals |
+| Extended query (Parse/Bind/Execute/Sync) | Done | Parse/Bind/Execute/Sync, param substitution $1/$2/? |
+| Close (C) | Done | Statement/Portal |
 | Terminate (X) | Done | |
-| Prepared statements | Pending | |
 | COPY protocol | Pending | |
 
 ## Storage Parity

@@ -1,4 +1,7 @@
-use crate::planner::{plan_statement, AggregateFunc, Plan, ProjectionItem};
+use crate::planner::{
+    plan_statement, AggregateFunc, HavingCond, HavingOp, HavingOperand, OrderBySpec,
+    OrderBySpecKind, Plan, ProjectionItem,
+};
 use datacave_core::catalog::{Catalog, TableSchema};
 use datacave_core::error::DatacaveError;
 use datacave_core::mvcc::MvccManager;
@@ -147,22 +150,35 @@ impl SqlExecutor {
         let has_aggregates = plan
             .projection
             .iter()
-            .any(|p| matches!(p, ProjectionItem::Aggregate(_, _)));
-        if has_aggregates {
-            let (columns, agg_row) =
-                compute_aggregates(&plan.projection, &schema.columns, &rows)?;
-            return Ok(SqlResult {
-                columns,
-                rows: vec![agg_row],
-                rows_affected: 0,
-            });
-        }
+            .any(|p| matches!(p, ProjectionItem::Aggregate(_, _, _)));
+        let (columns, result_rows) = if has_aggregates {
+            if plan.group_by.is_empty() {
+                let (cols, agg_row) =
+                    compute_aggregates(&plan.projection, &schema.columns, &rows)?;
+                (cols, vec![agg_row])
+            } else {
+                compute_grouped_aggregates(
+                    &plan.projection,
+                    &plan.group_by,
+                    &schema.columns,
+                    &rows,
+                    plan.having.as_ref(),
+                )?
+            }
+        } else {
+            apply_projection(&plan.projection, &schema.columns, &rows)
+        };
 
-        let (columns, projected_rows) =
-            apply_projection(&plan.projection, &schema.columns, &rows);
+        let rows = apply_order_limit(
+            &columns,
+            result_rows,
+            &plan.order_by,
+            plan.limit,
+            plan.offset,
+        )?;
         Ok(SqlResult {
             columns,
-            rows: projected_rows,
+            rows,
             rows_affected: 0,
         })
     }
@@ -236,32 +252,35 @@ impl SqlExecutor {
         let has_aggregates = plan
             .projection
             .iter()
-            .any(|p| matches!(p, ProjectionItem::Aggregate(_, _)));
-        if has_aggregates {
+            .any(|p| matches!(p, ProjectionItem::Aggregate(_, _, _)));
+        let (out_columns, result_rows) = if has_aggregates {
             if plan.group_by.is_empty() {
-                let (out_columns, agg_row) =
+                let (cols, agg_row) =
                     compute_aggregates(&plan.projection, &columns, &joined_rows)?;
-                return Ok(SqlResult {
-                    columns: out_columns,
-                    rows: vec![agg_row],
-                    rows_affected: 0,
-                });
+                (cols, vec![agg_row])
             } else {
-                let (out_columns, grouped_rows) =
-                    compute_grouped_aggregates(&plan.projection, &plan.group_by, &columns, &joined_rows)?;
-                return Ok(SqlResult {
-                    columns: out_columns,
-                    rows: grouped_rows,
-                    rows_affected: 0,
-                });
+                compute_grouped_aggregates(
+                    &plan.projection,
+                    &plan.group_by,
+                    &columns,
+                    &joined_rows,
+                    plan.having.as_ref(),
+                )?
             }
-        }
+        } else {
+            apply_projection(&plan.projection, &columns, &joined_rows)
+        };
 
-        let (out_columns, projected_rows) =
-            apply_projection(&plan.projection, &columns, &joined_rows);
+        let rows = apply_order_limit(
+            &out_columns,
+            result_rows,
+            &plan.order_by,
+            plan.limit,
+            plan.offset,
+        )?;
         Ok(SqlResult {
             columns: out_columns,
-            rows: projected_rows,
+            rows,
             rows_affected: 0,
         })
     }
@@ -425,6 +444,7 @@ fn compute_grouped_aggregates(
     group_by: &[String],
     schema: &[Column],
     rows: &[DataRow],
+    having: Option<&HavingCond>,
 ) -> Result<(Vec<Column>, Vec<DataRow>), DatacaveError> {
     let group_indices: Vec<usize> = group_by
         .iter()
@@ -448,35 +468,42 @@ fn compute_grouped_aggregates(
     }
 
     let mut out_columns = Vec::new();
-    let mut col_order: Vec<(bool, usize)> = Vec::new(); // (is_group, index)
+    let mut col_order: Vec<(bool, usize)> = Vec::new();
+    let mut output_names: Vec<String> = Vec::new();
 
     for item in projection {
         match item {
-            ProjectionItem::Column(name) => {
+            ProjectionItem::Column(name, alias) => {
                 if group_by.contains(name) {
+                    let out_name = alias.clone().unwrap_or_else(|| name.clone());
                     out_columns.push(Column {
-                        name: name.clone(),
+                        name: out_name.clone(),
                         data_type: schema
                             .iter()
                             .find(|c| c.name == *name)
                             .map(|c| c.data_type.clone())
                             .unwrap_or_else(|| "TEXT".to_string()),
                     });
+                    output_names.push(out_name);
                     col_order.push((true, group_by.iter().position(|g| g == name).unwrap()));
                 }
             }
-            ProjectionItem::Aggregate(func, _) => {
-                let agg_name = match func {
-                    AggregateFunc::Count => "count",
-                    AggregateFunc::Sum => "sum",
-                    AggregateFunc::Avg => "avg",
-                    AggregateFunc::Min => "min",
-                    AggregateFunc::Max => "max",
-                };
+            ProjectionItem::Aggregate(func, _, alias) => {
+                let agg_name = alias.clone().unwrap_or_else(|| {
+                    match func {
+                        AggregateFunc::Count => "count",
+                        AggregateFunc::Sum => "sum",
+                        AggregateFunc::Avg => "avg",
+                        AggregateFunc::Min => "min",
+                        AggregateFunc::Max => "max",
+                    }
+                    .to_string()
+                });
                 out_columns.push(Column {
-                    name: agg_name.to_string(),
+                    name: agg_name.clone(),
                     data_type: "BIGINT".to_string(),
                 });
+                output_names.push(agg_name);
                 col_order.push((false, 0));
             }
             ProjectionItem::AllColumns => {}
@@ -492,14 +519,14 @@ fn compute_grouped_aggregates(
         for (i, item) in projection.iter().enumerate() {
             let (is_group, idx) = col_order.get(i).copied().unwrap_or((false, 0));
             match item {
-                ProjectionItem::Column(name) => {
+                ProjectionItem::Column(name, _) => {
                     if is_group && group_by.contains(name) {
                         if let Some(v) = group_values.get(idx) {
                             out_values.push(v.clone());
                         }
                     }
                 }
-                ProjectionItem::Aggregate(func, col) => {
+                ProjectionItem::Aggregate(func, col, _) => {
                     let col_idx = col.as_ref().and_then(|c| schema.iter().position(|sc| sc.name == *c));
                     let values: Vec<DataValue> = match col_idx {
                         Some(idx) => group_rows
@@ -535,27 +562,178 @@ fn compute_grouped_aggregates(
                             .map(DataValue::Float64)
                             .unwrap_or(DataValue::Null),
                     };
-                    let agg_name = match func {
-                        AggregateFunc::Count => "count",
-                        AggregateFunc::Sum => "sum",
-                        AggregateFunc::Avg => "avg",
-                        AggregateFunc::Min => "min",
-                        AggregateFunc::Max => "max",
-                    };
-                    out_columns.push(Column {
-                        name: agg_name.to_string(),
-                        data_type: "BIGINT".to_string(),
-                    });
                     out_values.push(result);
                 }
                 ProjectionItem::AllColumns => {}
             }
         }
-        out_rows.push(DataRow { values: out_values });
+        let row = DataRow { values: out_values };
+        if let Some(cond) = having {
+            if evaluate_having(cond, &output_names, &row, &group_rows, schema) {
+                out_rows.push(row);
+            }
+        } else {
+            out_rows.push(row);
+        }
     }
 
     Ok((out_columns, out_rows))
 }
+
+fn evaluate_having(
+    cond: &HavingCond,
+    col_names: &[String],
+    row: &DataRow,
+    group_rows: &[DataRow],
+    schema: &[Column],
+) -> bool {
+    let left_val = operand_value(&cond.left, col_names, row, group_rows, schema);
+    let right_val = operand_value(&cond.right, col_names, row, group_rows, schema);
+    match cond.op {
+        HavingOp::Eq => left_val == right_val,
+        HavingOp::NotEq => left_val != right_val,
+        HavingOp::Gt => cmp_data_value(&left_val, &right_val) == std::cmp::Ordering::Greater,
+        HavingOp::Gte => {
+            let o = cmp_data_value(&left_val, &right_val);
+            o == std::cmp::Ordering::Greater || o == std::cmp::Ordering::Equal
+        }
+        HavingOp::Lt => cmp_data_value(&left_val, &right_val) == std::cmp::Ordering::Less,
+        HavingOp::Lte => {
+            let o = cmp_data_value(&left_val, &right_val);
+            o == std::cmp::Ordering::Less || o == std::cmp::Ordering::Equal
+        }
+    }
+}
+
+fn operand_value(
+    op: &HavingOperand,
+    col_names: &[String],
+    row: &DataRow,
+    group_rows: &[DataRow],
+    schema: &[Column],
+) -> DataValue {
+    match op {
+        HavingOperand::Literal(v) => v.clone(),
+        HavingOperand::ColumnOrAlias(name) => {
+            col_names
+                .iter()
+                .position(|c| c == name)
+                .and_then(|i| row.values.get(i).cloned())
+                .unwrap_or(DataValue::Null)
+        }
+        HavingOperand::Aggregate(func, col) => {
+            let col_idx = col.as_ref().and_then(|c| schema.iter().position(|sc| sc.name == *c));
+            let values: Vec<DataValue> = match col_idx {
+                Some(idx) => group_rows
+                    .iter()
+                    .filter_map(|r| {
+                        r.values
+                            .get(idx)
+                            .cloned()
+                            .filter(|v| !matches!(v, DataValue::Null))
+                    })
+                    .collect(),
+                None => group_rows.iter().map(|_| DataValue::Int64(1)).collect(),
+            };
+            match func {
+                AggregateFunc::Count => DataValue::Int64(values.len() as i64),
+                AggregateFunc::Sum => {
+                    let sum: f64 = values.iter().filter_map(try_numeric).sum();
+                    DataValue::Float64(sum)
+                }
+                AggregateFunc::Avg => {
+                    let sum: f64 = values.iter().filter_map(try_numeric).sum();
+                    let count = values.len() as f64;
+                    DataValue::Float64(if count > 0.0 { sum / count } else { 0.0 })
+                }
+                AggregateFunc::Min => values
+                    .iter()
+                    .filter_map(try_numeric)
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(DataValue::Float64)
+                    .unwrap_or(DataValue::Null),
+                AggregateFunc::Max => values
+                    .iter()
+                    .filter_map(try_numeric)
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(DataValue::Float64)
+                    .unwrap_or(DataValue::Null),
+            }
+        }
+    }
+}
+
+fn apply_order_limit(
+    columns: &[Column],
+    mut rows: Vec<DataRow>,
+    order_by: &[OrderBySpec],
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<Vec<DataRow>, DatacaveError> {
+    let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+
+    if !order_by.is_empty() {
+        rows.sort_by(|a, b| {
+            for spec in order_by {
+                let (idx, asc) = match &spec.spec {
+                    OrderBySpecKind::ColumnOrAlias(name) => {
+                        let i = col_names.iter().position(|c| c == name);
+                        match i {
+                            Some(i) => (i, spec.asc),
+                            None => continue,
+                        }
+                    }
+                    OrderBySpecKind::Position(pos) => {
+                        let i = pos.saturating_sub(1);
+                        if i < col_names.len() {
+                            (i, spec.asc)
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+                let a_val = a.values.get(idx).unwrap_or(&DataValue::Null);
+                let b_val = b.values.get(idx).unwrap_or(&DataValue::Null);
+                let o = cmp_data_value(a_val, b_val);
+                if o != std::cmp::Ordering::Equal {
+                    return if asc { o } else { o.reverse() };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    let skip = offset.unwrap_or(0) as usize;
+    let take = limit.map(|n| n as usize).unwrap_or(rows.len());
+    let rows: Vec<DataRow> = rows
+        .into_iter()
+        .skip(skip)
+        .take(take)
+        .collect();
+    Ok(rows)
+}
+
+fn cmp_data_value(a: &DataValue, b: &DataValue) -> std::cmp::Ordering {
+    match (a, b) {
+        (DataValue::Null, DataValue::Null) => std::cmp::Ordering::Equal,
+        (DataValue::Null, _) => std::cmp::Ordering::Less,
+        (_, DataValue::Null) => std::cmp::Ordering::Greater,
+        (DataValue::Int64(x), DataValue::Int64(y)) => x.cmp(y),
+        (DataValue::Float64(x), DataValue::Float64(y)) => {
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (DataValue::Int64(x), DataValue::Float64(y)) => {
+            (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (DataValue::Float64(x), DataValue::Int64(y)) => {
+            x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (DataValue::String(x), DataValue::String(y)) => x.cmp(y),
+        (DataValue::Bool(x), DataValue::Bool(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
 
 fn compute_aggregates(
     projection: &[ProjectionItem],
@@ -566,7 +744,7 @@ fn compute_aggregates(
     let mut out_values = Vec::new();
     for item in projection {
         match item {
-            ProjectionItem::Aggregate(func, col) => {
+            ProjectionItem::Aggregate(func, col, _alias) => {
                 let col_idx = col.as_ref().and_then(|c| {
                     schema.iter().position(|sc| sc.name == *c)
                 });
@@ -649,7 +827,7 @@ fn apply_projection(
     let mut col_indices = Vec::new();
     let mut columns = Vec::new();
     for item in projection {
-        if let ProjectionItem::Column(name) = item {
+        if let ProjectionItem::Column(name, _) = item {
             if let Some((idx, col)) = schema.iter().enumerate().find(|(_, c)| c.name == *name) {
                 col_indices.push(idx);
                 columns.push(col.clone());

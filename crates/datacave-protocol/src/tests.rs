@@ -171,6 +171,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_flush_message() {
+        let msg = write_frontend_msg(b'H', &[]);
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&msg).await.expect("write");
+        let parsed = read_message(&mut server).await.expect("read");
+        match parsed {
+            FrontendMessage::Flush => {}
+            _ => panic!("expected Flush, got {:?}", parsed),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extended_query_sequence_including_flush() {
+        let mut msgs = Vec::new();
+        let mut parse_payload = Vec::new();
+        parse_payload.extend_from_slice(b"s\0");
+        parse_payload.extend_from_slice(b"SELECT 1\0");
+        parse_payload.extend_from_slice(&0i16.to_be_bytes());
+        msgs.push(write_frontend_msg(b'P', &parse_payload));
+        let mut bind_payload = Vec::new();
+        bind_payload.extend_from_slice(b"\0");
+        bind_payload.extend_from_slice(b"s\0");
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0i16.to_be_bytes());
+        msgs.push(write_frontend_msg(b'B', &bind_payload));
+        let mut describe_payload = Vec::new();
+        describe_payload.push(b'S');
+        describe_payload.extend_from_slice(b"s\0");
+        msgs.push(write_frontend_msg(b'D', &describe_payload));
+        let mut execute_payload = Vec::new();
+        execute_payload.extend_from_slice(b"\0");
+        execute_payload.extend_from_slice(&0i32.to_be_bytes());
+        msgs.push(write_frontend_msg(b'E', &execute_payload));
+        msgs.push(write_frontend_msg(b'S', &[]));
+        msgs.push(write_frontend_msg(b'H', &[]));
+
+        let (mut client, mut server) = tokio::io::duplex(512);
+        for m in &msgs {
+            client.write_all(m).await.expect("write");
+        }
+
+        let parsed = [
+            read_message(&mut server).await.expect("read"),
+            read_message(&mut server).await.expect("read"),
+            read_message(&mut server).await.expect("read"),
+            read_message(&mut server).await.expect("read"),
+            read_message(&mut server).await.expect("read"),
+            read_message(&mut server).await.expect("read"),
+        ];
+        assert!(matches!(parsed[0], FrontendMessage::Parse { .. }));
+        assert!(matches!(parsed[1], FrontendMessage::Bind { .. }));
+        assert!(matches!(parsed[2], FrontendMessage::Describe { .. }));
+        assert!(matches!(parsed[3], FrontendMessage::Execute { .. }));
+        assert!(matches!(parsed[4], FrontendMessage::Sync));
+        assert!(matches!(parsed[5], FrontendMessage::Flush));
+    }
+
+    #[tokio::test]
     async fn write_parse_complete() {
         let (mut client, mut server) = tokio::io::duplex(32);
         write_message(&mut server, BackendMessage::ParseComplete)
@@ -252,5 +311,54 @@ mod tests {
         client.read_exact(&mut bytes).await.expect("read");
         assert_eq!(bytes[0], b'n');
         assert_eq!(i32::from_be_bytes(bytes[1..5].try_into().unwrap()), 4);
+    }
+
+    #[tokio::test]
+    async fn write_row_description_with_type_oids() {
+        use crate::messages::RowDescriptionField;
+        let fields = vec![
+            RowDescriptionField::with_type("id", "INT"),
+            RowDescriptionField::with_type("name", "TEXT"),
+        ];
+        let (mut client, mut server) = tokio::io::duplex(128);
+        write_message(&mut server, BackendMessage::RowDescription { fields })
+            .await
+            .expect("write");
+        let mut typ = [0u8; 1];
+        client.read_exact(&mut typ).await.expect("read type");
+        assert_eq!(typ[0], b'T', "RowDescription uses type 'T'");
+        let mut len_bytes = [0u8; 4];
+        client.read_exact(&mut len_bytes).await.expect("read len");
+        let len = i32::from_be_bytes(len_bytes) as usize;
+        let mut payload = vec![0u8; len.saturating_sub(4)];
+        if !payload.is_empty() {
+            client.read_exact(&mut payload).await.expect("read payload");
+        }
+        let ncols = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+        assert_eq!(ncols, 2);
+        let mut i = 2;
+        for (name, expected_oid) in [("id", 23i32), ("name", 25i32)] {
+            let nul = payload[i..].iter().position(|&b| b == 0).unwrap();
+            assert_eq!(String::from_utf8_lossy(&payload[i..i + nul]), name);
+            i += nul + 1;
+            i += 4 + 2;
+            let oid = i32::from_be_bytes(payload[i..i + 4].try_into().unwrap());
+            assert_eq!(oid, expected_oid);
+            i += 4 + 2 + 4 + 2;
+        }
+    }
+
+    #[tokio::test]
+    async fn data_type_to_oid_mapping() {
+        use crate::messages::data_type_to_oid;
+        assert_eq!(data_type_to_oid("INT"), 23);
+        assert_eq!(data_type_to_oid("INTEGER"), 23);
+        assert_eq!(data_type_to_oid("BIGINT"), 20);
+        assert_eq!(data_type_to_oid("TEXT"), 25);
+        assert_eq!(data_type_to_oid("VARCHAR"), 25);
+        assert_eq!(data_type_to_oid("BOOLEAN"), 16);
+        assert_eq!(data_type_to_oid("FLOAT"), 700);
+        assert_eq!(data_type_to_oid("DOUBLE"), 701);
+        assert_eq!(data_type_to_oid("unknown"), 25);
     }
 }

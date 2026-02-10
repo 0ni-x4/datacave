@@ -51,10 +51,10 @@ pub async fn write_message<S: AsyncWrite + Unpin>(stream: &mut S, msg: BackendMe
             let mut payload = BytesMut::new();
             payload.put_i16(fields.len() as i16);
             for field in fields {
-                put_cstring(&mut payload, &field);
+                put_cstring(&mut payload, &field.name);
                 payload.put_i32(0);
                 payload.put_i16(0);
-                payload.put_i32(25);
+                payload.put_i32(field.type_oid);
                 payload.put_i16(-1);
                 payload.put_i32(0);
                 payload.put_i16(0);
