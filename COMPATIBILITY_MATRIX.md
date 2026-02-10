@@ -17,20 +17,20 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 | Feature | Status | Implementation Notes |
 |---------|--------|------------------------|
 | `INSERT` | Supported | Values list; single-table only. Column list optional; values aligned by schema or position. |
-| `SELECT` | Supported | Single-table projection, `*`, qualified column names. No WHERE filtering. ORDER BY, LIMIT, OFFSET supported. |
-| `UPDATE` | Supported | Single-table assignments; no WHERE (updates all visible rows). |
-| `DELETE` | Supported | Single-table; no WHERE (deletes all visible rows). |
+| `SELECT` | Supported | Single-table or INNER JOIN; projection, `*`, qualified column names. WHERE with column op literal (=, !=, >, >=, <, <=) and AND. ORDER BY, LIMIT, OFFSET supported. |
+| `UPDATE` | Supported | Single-table assignments. WHERE with column op literal and AND (updates only matching rows). |
+| `DELETE` | Supported | Single-table. WHERE with column op literal and AND (deletes only matching rows). |
 
 ### Joins
 
 | Feature | Status | Implementation Notes |
 |---------|--------|------------------------|
-| `INNER JOIN` | Supported | Two-table only. Equality `ON col1 = col2` or `USING (col)`. Executor uses first join only. |
-| `LEFT JOIN` | Not supported | Planner returns `None` for non-inner joins. |
-| `RIGHT JOIN` | Not supported | Planner returns `None`. |
+| `INNER JOIN` | Supported | Multi-table chains (3+). Equality `ON col1 = col2` or `USING (col)`. |
+| `LEFT JOIN` | Supported | Multi-table chains; equality ON or USING. |
+| `RIGHT JOIN` | Not supported | Planner returns `None` for non-inner/non-left. |
 | `FULL OUTER JOIN` | Not supported | Planner returns `None`. |
 | `CROSS JOIN` | Not supported | Planner returns `None`. |
-| Multi-table (3+) joins | Not supported | Planner rejects; extract_equality_columns fails for chained joins. |
+| Multi-table (3+) joins | Supported | INNER/LEFT chain; ON must reference tables in scope; USING supported. When selecting multiple columns with the same unqualified name from different tables (e.g. `customers.name`, `products.name`), use qualified names in SELECT; column order may vary. |
 
 ### Aggregations
 
@@ -43,7 +43,7 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 | `MIN(col)` | Supported | Returns `Float64` for numeric; nulls excluded. |
 | `MAX(col)` | Supported | Returns `Float64` for numeric; nulls excluded. |
 | `GROUP BY` | Supported | Single-table and join+aggregate. `GROUP BY ALL` not supported. |
-| `HAVING` | Partial | Only with GROUP BY. Column/alias or literal operands; `=`, `!=`, `<`, `<=`, `>`, `>=`. Aggregate expressions (e.g. `HAVING COUNT(*) > 2`) not supported. |
+| `HAVING` | Supported | Only with GROUP BY. Column/alias, literal, or aggregate operands; `=`, `!=`, `<`, `<=`, `>`, `>=`. Aggregate expressions (e.g. `HAVING COUNT(*) > 2`, `HAVING SUM(amount) >= 100`) supported. AND for compound conditions. Single-table and join-grouped. |
 
 ### Aggregates on Joined Rows
 
@@ -51,6 +51,8 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 |---------|--------|------------------------|
 | `SELECT COUNT(*) FROM t1 JOIN t2 ON ...` | Supported | Join executed first; aggregates computed on joined result. |
 | `SELECT SUM(col) FROM t1 JOIN t2 ON ...` | Supported | Same as above. |
+| `SELECT ... FROM t1 JOIN t2 ON ... ORDER BY col LIMIT n` | Supported | JOIN executed first; ORDER BY and LIMIT applied to joined result. |
+| `SELECT ... FROM t1 JOIN t2 ON ... WHERE col = lit` | Supported | WHERE applied to joined result (col op literal). |
 
 ### Ordering and Pagination
 
@@ -74,7 +76,7 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 | Feature | Status | Implementation Notes |
 |---------|--------|------------------------|
 | Subqueries | Not supported | Planned (IN, EXISTS, scalar). |
-| `WHERE` | Not supported | SELECT, UPDATE, DELETE ignore WHERE. |
+| `WHERE` | Supported | SELECT, UPDATE, DELETE. Predicates: column op literal for =, !=, >, >=, <, <=. AND and OR combinations, parenthesized expressions. Column/literal order arbitrary. No functions, subqueries. |
 
 ## Wire Protocol
 
@@ -127,4 +129,4 @@ This document lists implemented SQL semantics and wire protocol behaviors with p
 ## Test Coverage
 
 - **Unit tests**: `datacave-sql/tests.rs` — create/insert/select, aggregates, inner join, transaction commands.
-- **Integration tests**: `datacave-server/server.rs` — simple query roundtrip, CREATE/INSERT/SELECT, BEGIN/COMMIT/ROLLBACK, extended query Parse/Bind/Execute/Sync, joins+aggregates via simple query.
+- **Integration tests**: `datacave-server/server.rs` — simple query roundtrip, CREATE/INSERT/SELECT, BEGIN/COMMIT/ROLLBACK, extended query Parse/Bind/Execute/Sync, joins+aggregates, join+order_by+limit, join+where, WHERE with OR/parentheses, HAVING aggregate expression via simple query. Three-table join exercised (expects failure until supported).

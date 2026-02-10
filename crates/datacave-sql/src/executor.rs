@@ -1,6 +1,6 @@
 use crate::planner::{
-    plan_statement, AggregateFunc, HavingCond, HavingOp, HavingOperand, OrderBySpec,
-    OrderBySpecKind, Plan, ProjectionItem,
+    plan_statement, AggregateFunc, HavingCond, HavingOp, HavingOperand, JoinKind, OrderBySpec,
+    OrderBySpecKind, Plan, ProjectionItem, WhereCond, WhereOperand, WherePredicate,
 };
 use datacave_core::catalog::{Catalog, TableSchema};
 use datacave_core::error::DatacaveError;
@@ -147,6 +147,8 @@ impl SqlExecutor {
             .cloned()
             .ok_or_else(|| DatacaveError::Sql(format!("unknown table: {}", plan.table)))?;
 
+        let rows = filter_rows_by_where(rows, plan.where_clause.as_ref(), &schema.columns);
+
         let has_aggregates = plan
             .projection
             .iter()
@@ -189,65 +191,80 @@ impl SqlExecutor {
         tenant_id: Option<&str>,
         version: u64,
     ) -> Result<SqlResult, DatacaveError> {
-        let join = plan.joins.first().ok_or_else(|| {
-            DatacaveError::Sql("join plan has no join spec".into())
-        })?;
-        let left_schema = self
-            .catalog
-            .lock()
-            .unwrap()
-            .get_table(&plan.table)
-            .cloned()
-            .ok_or_else(|| DatacaveError::Sql(format!("unknown table: {}", plan.table)))?;
-        let right_schema = self
-            .catalog
-            .lock()
-            .unwrap()
-            .get_table(&join.right_table)
-            .cloned()
-            .ok_or_else(|| DatacaveError::Sql(format!("unknown table: {}", join.right_table)))?;
+        let base_schema = {
+            let catalog = self.catalog.lock().unwrap();
+            catalog
+                .get_table(&plan.table)
+                .cloned()
+                .ok_or_else(|| DatacaveError::Sql(format!("unknown table: {}", plan.table)))?
+        };
 
-        let left_rows = self
+        let mut columns = qualify_columns(&base_schema.columns, &plan.table);
+        let mut joined_rows = self
             .fetch_table_rows(&plan.table, tenant_id, version)
             .await?;
-        let right_rows = self
-            .fetch_table_rows(&join.right_table, tenant_id, version)
-            .await?;
 
-        let left_col_idx = left_schema
-            .columns
-            .iter()
-            .position(|c| c.name == join.left_column)
-            .ok_or_else(|| {
-                DatacaveError::Sql(format!(
-                    "join column not found: {}.{}",
-                    plan.table, join.left_column
-                ))
-            })?;
-        let right_col_idx = right_schema
-            .columns
-            .iter()
-            .position(|c| c.name == join.right_column)
-            .ok_or_else(|| {
-                DatacaveError::Sql(format!(
-                    "join column not found: {}.{}",
-                    join.right_table, join.right_column
-                ))
-            })?;
+        for join in &plan.joins {
+            let right_schema = {
+                let catalog = self.catalog.lock().unwrap();
+                catalog
+                    .get_table(&join.right_table)
+                    .cloned()
+                    .ok_or_else(|| DatacaveError::Sql(format!("unknown table: {}", join.right_table)))?
+            };
 
-        let mut joined_rows = Vec::new();
-        for left_row in &left_rows {
-            for right_row in &right_rows {
-                if left_row.values.get(left_col_idx) == right_row.values.get(right_col_idx) {
+            let right_rows = self
+                .fetch_table_rows(&join.right_table, tenant_id, version)
+                .await?;
+
+            let left_col_idx = resolve_column_index(&columns, &join.left_column)
+                .ok_or_else(|| {
+                    DatacaveError::Sql(format!(
+                        "join column not found: {} (left side)",
+                        join.left_column
+                    ))
+                })?;
+            let right_col_idx = right_schema
+                .columns
+                .iter()
+                .position(|c| c.name == join.right_column)
+                .ok_or_else(|| {
+                    DatacaveError::Sql(format!(
+                        "join column not found: {}.{}",
+                        join.right_table, join.right_column
+                    ))
+                })?;
+
+            let mut new_rows = Vec::new();
+            let right_null_row: Vec<DataValue> = right_schema
+                .columns
+                .iter()
+                .map(|_| DataValue::Null)
+                .collect();
+
+            for left_row in &joined_rows {
+                let mut matched = false;
+                for right_row in &right_rows {
+                    if left_row.values.get(left_col_idx) == right_row.values.get(right_col_idx) {
+                        let mut values = left_row.values.clone();
+                        values.extend(right_row.values.iter().cloned());
+                        new_rows.push(DataRow { values });
+                        matched = true;
+                    }
+                }
+                if join.kind == JoinKind::LeftOuter && !matched {
                     let mut values = left_row.values.clone();
-                    values.extend(right_row.values.iter().cloned());
-                    joined_rows.push(DataRow { values });
+                    values.extend(right_null_row.iter().cloned());
+                    new_rows.push(DataRow { values });
                 }
             }
+
+            let right_cols = qualify_columns(&right_schema.columns, &join.right_table);
+            columns.extend(right_cols);
+            joined_rows = new_rows;
         }
 
-        let mut columns = left_schema.columns.clone();
-        columns.extend(right_schema.columns.clone());
+        let joined_rows = filter_rows_by_where(joined_rows, plan.where_clause.as_ref(), &columns);
 
         let has_aggregates = plan
             .projection
@@ -334,6 +351,11 @@ impl SqlExecutor {
             {
                 let mut row: DataRow =
                     bincode::deserialize(&bytes).map_err(|e| DatacaveError::Storage(e.to_string()))?;
+                if let Some(ref cond) = plan.where_clause {
+                    if !evaluate_where(cond, &row, &schema.columns) {
+                        continue;
+                    }
+                }
                 for (col, val) in &plan.assignments {
                     if let Some(idx) = schema.columns.iter().position(|c| c.name == *col) {
                         if idx < row.values.len() {
@@ -366,15 +388,29 @@ impl SqlExecutor {
         let mut rows_affected = 0;
         let snapshot = self.mvcc.snapshot();
         let max_row_id = self.current_row_count(&plan.table, tenant_id);
+        let schema = self
+            .catalog
+            .lock()
+            .unwrap()
+            .get_table(&plan.table)
+            .cloned()
+            .ok_or_else(|| DatacaveError::Sql(format!("unknown table: {}", plan.table)))?;
+
         for row_id in 0..max_row_id {
             let key = encode_row_key(&plan.table, row_id, tenant_id);
-            if self
+            if let Some(bytes) = self
                 .storage
                 .get(&key, snapshot.version)
                 .await
                 .map_err(|e| DatacaveError::Storage(e.to_string()))?
-                .is_some()
             {
+                if let Some(ref cond) = plan.where_clause {
+                    let row: DataRow =
+                        bincode::deserialize(&bytes).map_err(|e| DatacaveError::Storage(e.to_string()))?;
+                    if !evaluate_where(cond, &row, &schema.columns) {
+                        continue;
+                    }
+                }
                 let version = self.mvcc.next_version();
                 self.storage
                     .delete(&key, version)
@@ -417,6 +453,23 @@ fn encode_row_key(table: &str, row_id: u64, tenant_id: Option<&str>) -> Vec<u8> 
     out
 }
 
+fn qualify_columns(cols: &[Column], table: &str) -> Vec<Column> {
+    cols.iter()
+        .map(|c| Column {
+            name: format!("{}.{}", table, c.name),
+            data_type: c.data_type.clone(),
+        })
+        .collect()
+}
+
+fn resolve_column_index(columns: &[Column], name: &str) -> Option<usize> {
+    if name.contains('.') {
+        columns.iter().position(|c| c.name == name)
+    } else {
+        columns.iter().position(|c| c.name == name || c.name.ends_with(&format!(".{}", name)))
+    }
+}
+
 fn tenant_key(table: &str, tenant_id: Option<&str>) -> String {
     match tenant_id {
         Some(tenant) => format!("{tenant}.{table}"),
@@ -449,9 +502,7 @@ fn compute_grouped_aggregates(
     let group_indices: Vec<usize> = group_by
         .iter()
         .map(|name| {
-            schema
-                .iter()
-                .position(|c| c.name == *name)
+            schema_resolve_column_index(schema, name)
                 .ok_or_else(|| DatacaveError::Sql(format!("GROUP BY column not found: {}", name)))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -474,18 +525,29 @@ fn compute_grouped_aggregates(
     for item in projection {
         match item {
             ProjectionItem::Column(name, alias) => {
-                if group_by.contains(name) {
+                let in_group = group_by.iter().any(|g| g.eq_ignore_ascii_case(name))
+                    || schema_resolve_column_index(schema, name)
+                        .map(|idx| group_indices.contains(&idx))
+                        .unwrap_or(false);
+                if in_group {
+                    let pos = group_by.iter().position(|g| g.eq_ignore_ascii_case(name))
+                        .or_else(|| {
+                            schema_resolve_column_index(schema, name)
+                                .and_then(|idx| group_indices.iter().position(|&i| i == idx))
+                        })
+                        .unwrap_or(0);
                     let out_name = alias.clone().unwrap_or_else(|| name.clone());
                     out_columns.push(Column {
                         name: out_name.clone(),
-                        data_type: schema
-                            .iter()
-                            .find(|c| c.name == *name)
+                        data_type: schema_resolve_column_index(schema, name)
+                            .and_then(|i| schema.get(i))
                             .map(|c| c.data_type.clone())
                             .unwrap_or_else(|| "TEXT".to_string()),
                     });
                     output_names.push(out_name);
-                    col_order.push((true, group_by.iter().position(|g| g == name).unwrap()));
+                    col_order.push((true, pos));
+                } else {
+                    col_order.push((false, 0));
                 }
             }
             ProjectionItem::Aggregate(func, _, alias) => {
@@ -519,15 +581,15 @@ fn compute_grouped_aggregates(
         for (i, item) in projection.iter().enumerate() {
             let (is_group, idx) = col_order.get(i).copied().unwrap_or((false, 0));
             match item {
-                ProjectionItem::Column(name, _) => {
-                    if is_group && group_by.contains(name) {
+                ProjectionItem::Column(_, _) => {
+                    if is_group {
                         if let Some(v) = group_values.get(idx) {
                             out_values.push(v.clone());
                         }
                     }
                 }
                 ProjectionItem::Aggregate(func, col, _) => {
-                    let col_idx = col.as_ref().and_then(|c| schema.iter().position(|sc| sc.name == *c));
+                    let col_idx = col.as_ref().and_then(|c| schema_resolve_column_index(schema, c));
                     let values: Vec<DataValue> = match col_idx {
                         Some(idx) => group_rows
                             .iter()
@@ -587,20 +649,28 @@ fn evaluate_having(
     group_rows: &[DataRow],
     schema: &[Column],
 ) -> bool {
-    let left_val = operand_value(&cond.left, col_names, row, group_rows, schema);
-    let right_val = operand_value(&cond.right, col_names, row, group_rows, schema);
-    match cond.op {
-        HavingOp::Eq => left_val == right_val,
-        HavingOp::NotEq => left_val != right_val,
-        HavingOp::Gt => cmp_data_value(&left_val, &right_val) == std::cmp::Ordering::Greater,
-        HavingOp::Gte => {
-            let o = cmp_data_value(&left_val, &right_val);
-            o == std::cmp::Ordering::Greater || o == std::cmp::Ordering::Equal
+    match cond {
+        HavingCond::Predicate(p) => {
+            let left_val = operand_value(&p.left, col_names, row, group_rows, schema);
+            let right_val = operand_value(&p.right, col_names, row, group_rows, schema);
+            match p.op {
+                HavingOp::Eq => left_val == right_val,
+                HavingOp::NotEq => left_val != right_val,
+                HavingOp::Gt => cmp_data_value(&left_val, &right_val) == std::cmp::Ordering::Greater,
+                HavingOp::Gte => {
+                    let o = cmp_data_value(&left_val, &right_val);
+                    o == std::cmp::Ordering::Greater || o == std::cmp::Ordering::Equal
+                }
+                HavingOp::Lt => cmp_data_value(&left_val, &right_val) == std::cmp::Ordering::Less,
+                HavingOp::Lte => {
+                    let o = cmp_data_value(&left_val, &right_val);
+                    o == std::cmp::Ordering::Less || o == std::cmp::Ordering::Equal
+                }
+            }
         }
-        HavingOp::Lt => cmp_data_value(&left_val, &right_val) == std::cmp::Ordering::Less,
-        HavingOp::Lte => {
-            let o = cmp_data_value(&left_val, &right_val);
-            o == std::cmp::Ordering::Less || o == std::cmp::Ordering::Equal
+        HavingCond::And(left, right) => {
+            evaluate_having(left, col_names, row, group_rows, schema)
+                && evaluate_having(right, col_names, row, group_rows, schema)
         }
     }
 }
@@ -622,7 +692,7 @@ fn operand_value(
                 .unwrap_or(DataValue::Null)
         }
         HavingOperand::Aggregate(func, col) => {
-            let col_idx = col.as_ref().and_then(|c| schema.iter().position(|sc| sc.name == *c));
+            let col_idx = col.as_ref().and_then(|c| schema_resolve_column_index(schema, c));
             let values: Vec<DataValue> = match col_idx {
                 Some(idx) => group_rows
                     .iter()
@@ -670,14 +740,12 @@ fn apply_order_limit(
     limit: Option<u64>,
     offset: Option<u64>,
 ) -> Result<Vec<DataRow>, DatacaveError> {
-    let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-
     if !order_by.is_empty() {
         rows.sort_by(|a, b| {
             for spec in order_by {
                 let (idx, asc) = match &spec.spec {
                     OrderBySpecKind::ColumnOrAlias(name) => {
-                        let i = col_names.iter().position(|c| c == name);
+                        let i = schema_resolve_column_index(columns, name);
                         match i {
                             Some(i) => (i, spec.asc),
                             None => continue,
@@ -685,7 +753,7 @@ fn apply_order_limit(
                     }
                     OrderBySpecKind::Position(pos) => {
                         let i = pos.saturating_sub(1);
-                        if i < col_names.len() {
+                        if i < columns.len() {
                             (i, spec.asc)
                         } else {
                             continue;
@@ -711,6 +779,55 @@ fn apply_order_limit(
         .take(take)
         .collect();
     Ok(rows)
+}
+
+fn evaluate_where(cond: &WhereCond, row: &DataRow, schema: &[Column]) -> bool {
+    match cond {
+        WhereCond::Predicate(p) => evaluate_where_predicate(p, row, schema),
+        WhereCond::And(left, right) => {
+            evaluate_where(left, row, schema) && evaluate_where(right, row, schema)
+        }
+        WhereCond::Or(left, right) => {
+            evaluate_where(left, row, schema) || evaluate_where(right, row, schema)
+        }
+    }
+}
+
+fn evaluate_where_predicate(p: &WherePredicate, row: &DataRow, schema: &[Column]) -> bool {
+    let left_val = where_operand_value(&p.left, row, schema);
+    let right_val = where_operand_value(&p.right, row, schema);
+    match p.op {
+        HavingOp::Eq => left_val == right_val,
+        HavingOp::NotEq => left_val != right_val,
+        HavingOp::Gt => cmp_data_value(&left_val, &right_val) == std::cmp::Ordering::Greater,
+        HavingOp::Gte => {
+            let o = cmp_data_value(&left_val, &right_val);
+            o == std::cmp::Ordering::Greater || o == std::cmp::Ordering::Equal
+        }
+        HavingOp::Lt => cmp_data_value(&left_val, &right_val) == std::cmp::Ordering::Less,
+        HavingOp::Lte => {
+            let o = cmp_data_value(&left_val, &right_val);
+            o == std::cmp::Ordering::Less || o == std::cmp::Ordering::Equal
+        }
+    }
+}
+
+fn where_operand_value(op: &WhereOperand, row: &DataRow, schema: &[Column]) -> DataValue {
+    match op {
+        WhereOperand::Literal(v) => v.clone(),
+        WhereOperand::Column(name) => schema_resolve_column_index(schema, name)
+            .and_then(|i| row.values.get(i).cloned())
+            .unwrap_or(DataValue::Null),
+    }
+}
+
+fn filter_rows_by_where(rows: Vec<DataRow>, cond: Option<&WhereCond>, schema: &[Column]) -> Vec<DataRow> {
+    let Some(cond) = cond else {
+        return rows;
+    };
+    rows.into_iter()
+        .filter(|row| evaluate_where(cond, row, schema))
+        .collect()
 }
 
 fn cmp_data_value(a: &DataValue, b: &DataValue) -> std::cmp::Ordering {
@@ -744,10 +861,8 @@ fn compute_aggregates(
     let mut out_values = Vec::new();
     for item in projection {
         match item {
-            ProjectionItem::Aggregate(func, col, _alias) => {
-                let col_idx = col.as_ref().and_then(|c| {
-                    schema.iter().position(|sc| sc.name == *c)
-                });
+                ProjectionItem::Aggregate(func, col, _alias) => {
+                    let col_idx = col.as_ref().and_then(|c| schema_resolve_column_index(schema, c));
                 let values: Vec<DataValue> = match col_idx {
                     Some(idx) => rows
                         .iter()
@@ -828,7 +943,7 @@ fn apply_projection(
     let mut columns = Vec::new();
     for item in projection {
         if let ProjectionItem::Column(name, _) = item {
-            if let Some((idx, col)) = schema.iter().enumerate().find(|(_, c)| c.name == *name) {
+            if let Some((idx, col)) = projection_resolve_column(schema, name) {
                 col_indices.push(idx);
                 columns.push(col.clone());
             }
@@ -844,4 +959,30 @@ fn apply_projection(
         })
         .collect();
     (columns, projected_rows)
+}
+
+/// Resolve column by name: exact match first, then qualified (table.col) matches col, then unqualified first match.
+fn projection_resolve_column<'a>(schema: &'a [Column], name: &str) -> Option<(usize, &'a Column)> {
+    schema_resolve_column_index(schema, name).map(|i| (i, &schema[i]))
+}
+
+/// Resolve column index: exact match (case-insensitive), then qualified table.col match, then unqualified first match (deterministic).
+fn schema_resolve_column_index(schema: &[Column], name: &str) -> Option<usize> {
+    if let Some((i, _)) = schema.iter().enumerate().find(|(_, c)| c.name.eq_ignore_ascii_case(name)) {
+        return Some(i);
+    }
+    if name.contains('.') {
+        let parts: Vec<&str> = name.split('.').collect();
+        let table = parts[0].to_lowercase();
+        let col_name = parts.last().map(|p| p.to_lowercase()).unwrap_or_default();
+        if let Some((i, _)) = schema.iter().enumerate().find(|(_, c)| {
+            let cn = c.name.to_lowercase();
+            cn == format!("{}.{}", table, col_name) || (cn.starts_with(&format!("{}.", table)) && cn.ends_with(&format!(".{}", col_name)))
+        }) {
+            return Some(i);
+        }
+        return None;
+    }
+    schema.iter().enumerate().find(|(_, c)| c.name.eq_ignore_ascii_case(name) || c.name.to_lowercase().ends_with(&format!(".{}", name.to_lowercase())))
+        .map(|(i, _)| i)
 }

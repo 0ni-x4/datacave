@@ -349,6 +349,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_parameter_description() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        write_message(
+            &mut server,
+            BackendMessage::ParameterDescription {
+                param_oids: vec![25, 23],
+            },
+        )
+        .await
+        .expect("write");
+        let mut typ = [0u8; 1];
+        client.read_exact(&mut typ).await.expect("read type");
+        assert_eq!(typ[0], b't', "ParameterDescription uses type 't'");
+        let mut len_bytes = [0u8; 4];
+        client.read_exact(&mut len_bytes).await.expect("read len");
+        let len = i32::from_be_bytes(len_bytes) as usize;
+        let mut payload = vec![0u8; len.saturating_sub(4)];
+        if !payload.is_empty() {
+            client.read_exact(&mut payload).await.expect("read payload");
+        }
+        let nparams = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+        assert_eq!(nparams, 2);
+        let oid1 = i32::from_be_bytes(payload[2..6].try_into().unwrap());
+        let oid2 = i32::from_be_bytes(payload[6..10].try_into().unwrap());
+        assert_eq!(oid1, 25);
+        assert_eq!(oid2, 23);
+    }
+
+    #[tokio::test]
+    async fn write_parameter_description_empty() {
+        let (mut client, mut server) = tokio::io::duplex(32);
+        write_message(
+            &mut server,
+            BackendMessage::ParameterDescription {
+                param_oids: vec![],
+            },
+        )
+        .await
+        .expect("write");
+        let mut typ = [0u8; 1];
+        client.read_exact(&mut typ).await.expect("read type");
+        assert_eq!(typ[0], b't');
+        let mut len_bytes = [0u8; 4];
+        client.read_exact(&mut len_bytes).await.expect("read len");
+        let len = i32::from_be_bytes(len_bytes) as usize;
+        assert_eq!(len, 6, "length = 4 + 2 (nparams) + 0*4 (oids) = 6");
+        let mut payload = vec![0u8; len.saturating_sub(4)];
+        if !payload.is_empty() {
+            client.read_exact(&mut payload).await.expect("read payload");
+        }
+        let nparams = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+        assert_eq!(nparams, 0);
+    }
+
+    #[tokio::test]
     async fn data_type_to_oid_mapping() {
         use crate::messages::data_type_to_oid;
         assert_eq!(data_type_to_oid("INT"), 23);

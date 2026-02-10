@@ -9,11 +9,11 @@ Tracks implemented vs pending parity blocks for Datacave.
 | DDL: CREATE TABLE | Done | Basic schemas, column types, PRIMARY KEY |
 | DDL: DROP TABLE | Pending | Parser accepts; planner/executor not wired |
 | DML: INSERT | Done | Values list |
-| DML: SELECT | Done | Single-table, projection; no WHERE; ORDER BY, LIMIT, OFFSET |
-| DML: UPDATE | Done | Single-table; no WHERE (updates all) |
-| DML: DELETE | Done | Single-table; no WHERE (deletes all) |
-| Joins | Done | Two-table INNER JOIN; ON col1=col2 or USING (col) |
-| Aggregations | Done | COUNT, SUM, AVG, MIN, MAX; GROUP BY; HAVING (column/literal only, no agg expr) |
+| DML: SELECT | Done | Single-table or INNER JOIN; WHERE (col op literal); ORDER BY, LIMIT, OFFSET |
+| DML: UPDATE | Done | Single-table; WHERE optional |
+| DML: DELETE | Done | Single-table; WHERE optional |
+| Joins | Done | Two-table INNER JOIN; ON col1=col2 or USING (col); JOIN+ORDER BY+LIMIT supported |
+| Aggregations | Done | COUNT, SUM, AVG, MIN, MAX; GROUP BY; HAVING (column/literal/aggregate expr, AND) |
 | ORDER BY / LIMIT / OFFSET | Done | Column/position; numeric literals only |
 | Subqueries | Pending | IN, EXISTS, scalar subqueries |
 | Transactions (BEGIN/COMMIT/ROLLBACK) | Done | Mutating stmts buffered until COMMIT; no isolation |

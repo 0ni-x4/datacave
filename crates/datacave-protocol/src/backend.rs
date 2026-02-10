@@ -47,6 +47,16 @@ pub async fn write_message<S: AsyncWrite + Unpin>(stream: &mut S, msg: BackendMe
             buf.put_u8(b'n');
             buf.put_i32(4);
         }
+        BackendMessage::ParameterDescription { param_oids } => {
+            let mut payload = BytesMut::new();
+            payload.put_i16(param_oids.len() as i16);
+            for oid in param_oids {
+                payload.put_i32(oid);
+            }
+            buf.put_u8(b't');
+            buf.put_i32((payload.len() + 4) as i32);
+            buf.extend_from_slice(&payload);
+        }
         BackendMessage::RowDescription { fields } => {
             let mut payload = BytesMut::new();
             payload.put_i16(fields.len() as i16);

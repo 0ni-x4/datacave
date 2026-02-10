@@ -69,11 +69,19 @@ pub enum HavingOp {
     Lte,
 }
 
+/// Single HAVING predicate: left op right (column/alias, literal, or aggregate on either side).
 #[derive(Debug, Clone)]
-pub struct HavingCond {
+pub struct HavingPredicate {
     pub left: HavingOperand,
     pub op: HavingOp,
     pub right: HavingOperand,
+}
+
+/// HAVING condition: simple predicate or AND of conditions.
+#[derive(Debug, Clone)]
+pub enum HavingCond {
+    Predicate(HavingPredicate),
+    And(Box<HavingCond>, Box<HavingCond>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,11 +93,41 @@ pub enum AggregateFunc {
     Max,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    LeftOuter,
+}
+
 #[derive(Debug, Clone)]
 pub struct JoinSpec {
+    pub kind: JoinKind,
     pub right_table: String,
     pub left_column: String,
     pub right_column: String,
+}
+
+/// WHERE condition operand: column name or literal.
+#[derive(Debug, Clone)]
+pub enum WhereOperand {
+    Column(String),
+    Literal(DataValue),
+}
+
+/// Single predicate: column op literal (either order: col = lit or lit = col).
+#[derive(Debug, Clone)]
+pub struct WherePredicate {
+    pub left: WhereOperand,
+    pub op: HavingOp, // reuse comparison ops
+    pub right: WhereOperand,
+}
+
+/// WHERE condition: simple predicate, AND/OR of conditions, or parenthesized expressions.
+#[derive(Debug, Clone)]
+pub enum WhereCond {
+    Predicate(WherePredicate),
+    And(Box<WhereCond>, Box<WhereCond>),
+    Or(Box<WhereCond>, Box<WhereCond>),
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +135,8 @@ pub struct SelectPlan {
     pub table: String,
     pub joins: Vec<JoinSpec>,
     pub projection: Vec<ProjectionItem>,
+    /// WHERE clause (optional)
+    pub where_clause: Option<WhereCond>,
     /// Column names for GROUP BY (empty when no GROUP BY)
     pub group_by: Vec<String>,
     /// HAVING condition (only when GROUP BY present)
@@ -110,11 +150,15 @@ pub struct SelectPlan {
 pub struct UpdatePlan {
     pub table: String,
     pub assignments: Vec<(String, DataValue)>,
+    /// WHERE clause (optional)
+    pub where_clause: Option<WhereCond>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DeletePlan {
     pub table: String,
+    /// WHERE clause (optional)
+    pub where_clause: Option<WhereCond>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +227,7 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
                 };
                 let projection = plan_projection(&select.projection)?;
                 let joins = plan_joins(first_rel)?;
+                let where_clause = plan_where(select.selection.as_ref())?;
                 let group_by = plan_group_by(&select.group_by)?;
                 let having = plan_having(select.having.as_ref())?;
                 let order_by = plan_order_by(&query.order_by)?;
@@ -192,6 +237,7 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
                     table,
                     joins,
                     projection,
+                    where_clause,
                     group_by,
                     having,
                     order_by,
@@ -204,7 +250,7 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
         Statement::StartTransaction { .. } => Some(Plan::Begin(BeginPlan {})),
         Statement::Commit { .. } => Some(Plan::Commit(CommitPlan {})),
         Statement::Rollback { .. } => Some(Plan::Rollback(RollbackPlan {})),
-        Statement::Update { table, assignments, .. } => {
+        Statement::Update { table, assignments, selection, .. } => {
             let table = match &table.relation {
                 TableFactor::Table { name, .. } => object_name(name),
                 _ => return None,
@@ -213,18 +259,21 @@ pub fn plan_statement(stmt: &Statement) -> Option<Plan> {
                 .iter()
                 .filter_map(|a| a.id.first().map(|ident| (ident.value.clone(), expr_to_value(&a.value))))
                 .collect();
+            let where_clause = plan_where(selection.as_ref())?;
             Some(Plan::Update(UpdatePlan {
                 table,
                 assignments: assigns,
+                where_clause,
             }))
         }
-        Statement::Delete { from, .. } => {
+        Statement::Delete { from, selection, .. } => {
             let table = first_from_table(from)
                 .and_then(|relation| match &relation.relation {
                     TableFactor::Table { name, .. } => Some(object_name(name)),
                     _ => None,
                 })?;
-            Some(Plan::Delete(DeletePlan { table }))
+            let where_clause = plan_where(selection.as_ref())?;
+            Some(Plan::Delete(DeletePlan { table, where_clause }))
         }
         _ => None,
     }
@@ -284,7 +333,7 @@ fn parse_aggregate_func(func: &Function) -> Option<(AggregateFunc, Option<String
             Some(ident.value.clone())
         }
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
-            parts.last().map(|p| p.value.clone())
+            Some(parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>().join("."))
         }
         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
         FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => None,
@@ -301,6 +350,69 @@ fn parse_aggregate_func(func: &Function) -> Option<(AggregateFunc, Option<String
     Some((agg, arg))
 }
 
+fn plan_where(selection: Option<&Expr>) -> Option<Option<WhereCond>> {
+    match selection {
+        None => Some(None),
+        Some(expr) => {
+            let cond = parse_where_expr(expr)?;
+            Some(Some(cond))
+        }
+    }
+}
+
+fn parse_where_expr(expr: &Expr) -> Option<WhereCond> {
+    // Unwrap parenthesized expressions so (a OR b) parses correctly
+    if let Expr::Nested(inner) = expr {
+        return parse_where_expr(inner);
+    }
+    if let Expr::BinaryOp { left, op, right } = expr {
+        if *op == BinaryOperator::And {
+            let left_cond = parse_where_expr(left)?;
+            let right_cond = parse_where_expr(right)?;
+            return Some(WhereCond::And(Box::new(left_cond), Box::new(right_cond)));
+        }
+        if *op == BinaryOperator::Or {
+            let left_cond = parse_where_expr(left)?;
+            let right_cond = parse_where_expr(right)?;
+            return Some(WhereCond::Or(Box::new(left_cond), Box::new(right_cond)));
+        }
+        let op_enum = match op {
+            BinaryOperator::Eq => HavingOp::Eq,
+            BinaryOperator::NotEq => HavingOp::NotEq,
+            BinaryOperator::Gt => HavingOp::Gt,
+            BinaryOperator::GtEq => HavingOp::Gte,
+            BinaryOperator::Lt => HavingOp::Lt,
+            BinaryOperator::LtEq => HavingOp::Lte,
+            _ => return None,
+        };
+        let left_op = expr_to_where_operand(left)?;
+        let right_op = expr_to_where_operand(right)?;
+        // One must be Column, one must be Literal
+        match (&left_op, &right_op) {
+            (WhereOperand::Column(_), WhereOperand::Literal(_)) | (WhereOperand::Literal(_), WhereOperand::Column(_)) => {}
+            _ => return None,
+        }
+        Some(WhereCond::Predicate(WherePredicate {
+            left: left_op,
+            op: op_enum,
+            right: right_op,
+        }))
+    } else {
+        None
+    }
+}
+
+fn expr_to_where_operand(expr: &Expr) -> Option<WhereOperand> {
+    match expr {
+        Expr::Identifier(ident) => Some(WhereOperand::Column(ident.value.clone())),
+        Expr::CompoundIdentifier(parts) => {
+            Some(WhereOperand::Column(parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>().join(".")))
+        }
+        Expr::Value(_) => Some(WhereOperand::Literal(expr_to_value(expr))),
+        _ => None,
+    }
+}
+
 fn plan_group_by(group_by: &GroupByExpr) -> Option<Vec<String>> {
     match group_by {
         GroupByExpr::All => None, // GROUP BY ALL not supported
@@ -310,7 +422,7 @@ fn plan_group_by(group_by: &GroupByExpr) -> Option<Vec<String>> {
                 let col = match expr {
                     Expr::Identifier(ident) => ident.value.clone(),
                     Expr::CompoundIdentifier(parts) => {
-                        parts.last()?.value.clone()
+                        parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>().join(".")
                     }
                     _ => return None,
                 };
@@ -332,6 +444,11 @@ fn plan_having(having: Option<&Expr>) -> Option<Option<HavingCond>> {
 
 fn parse_having_expr(expr: &Expr) -> Option<HavingCond> {
     if let Expr::BinaryOp { left, op, right } = expr {
+        if *op == BinaryOperator::And {
+            let left_cond = parse_having_expr(left)?;
+            let right_cond = parse_having_expr(right)?;
+            return Some(HavingCond::And(Box::new(left_cond), Box::new(right_cond)));
+        }
         let op_enum = match op {
             BinaryOperator::Eq => HavingOp::Eq,
             BinaryOperator::NotEq => HavingOp::NotEq,
@@ -343,11 +460,11 @@ fn parse_having_expr(expr: &Expr) -> Option<HavingCond> {
         };
         let left_op = expr_to_having_operand(left)?;
         let right_op = expr_to_having_operand(right)?;
-        Some(HavingCond {
+        Some(HavingCond::Predicate(HavingPredicate {
             left: left_op,
             op: op_enum,
             right: right_op,
-        })
+        }))
     } else {
         None
     }
@@ -374,7 +491,7 @@ fn plan_order_by(order_by: &[OrderByExpr]) -> Option<Vec<OrderBySpec>> {
         let spec_kind = match &oe.expr {
             Expr::Identifier(ident) => OrderBySpecKind::ColumnOrAlias(ident.value.clone()),
             Expr::CompoundIdentifier(parts) => {
-                OrderBySpecKind::ColumnOrAlias(parts.last()?.value.clone())
+                OrderBySpecKind::ColumnOrAlias(parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>().join("."))
             }
             Expr::Value(Value::Number(n, _)) => {
                 let v: i64 = n.parse().ok()?;
@@ -424,10 +541,12 @@ fn plan_joins(rel: &TableWithJoins) -> Option<Vec<JoinSpec>> {
         _ => return None,
     };
     let mut joins = Vec::new();
-    let mut current_left = left_table;
+    let mut left_tables: Vec<String> = vec![left_table.clone()];
     for join in &rel.joins {
-        let JoinOperator::Inner(constraint) = &join.join_operator else {
-            return None;
+        let (constraint, kind) = match &join.join_operator {
+            JoinOperator::Inner(c) => (c, JoinKind::Inner),
+            JoinOperator::LeftOuter(c) => (c, JoinKind::LeftOuter),
+            _ => return None,
         };
         let right_table = match &join.relation {
             TableFactor::Table { name, .. } => object_name(name),
@@ -435,7 +554,7 @@ fn plan_joins(rel: &TableWithJoins) -> Option<Vec<JoinSpec>> {
         };
         let (left_col, right_col) = match constraint {
             JoinConstraint::On(expr) => {
-                extract_equality_columns(expr, &current_left, &right_table)?
+                extract_equality_columns(expr, &left_tables, &right_table)?
             }
             JoinConstraint::Using(names) => {
                 let col = names.first()?.value.clone();
@@ -444,18 +563,19 @@ fn plan_joins(rel: &TableWithJoins) -> Option<Vec<JoinSpec>> {
             JoinConstraint::Natural | JoinConstraint::None => return None,
         };
         joins.push(JoinSpec {
+            kind,
             right_table: right_table.clone(),
             left_column: left_col,
             right_column: right_col,
         });
-        current_left = format!("{}_join_{}", current_left, right_table);
+        left_tables.push(right_table);
     }
     Some(joins)
 }
 
 fn extract_equality_columns(
     expr: &Expr,
-    left_table: &str,
+    left_tables: &[String],
     right_table: &str,
 ) -> Option<(String, String)> {
     if let Expr::BinaryOp {
@@ -466,13 +586,33 @@ fn extract_equality_columns(
     {
         let (l_col, l_tbl) = expr_to_column_and_table(left)?;
         let (r_col, r_tbl) = expr_to_column_and_table(right)?;
-        let left_tbl_simple = left_table.split('.').last().unwrap_or(left_table);
         let right_tbl_simple = right_table.split('.').last().unwrap_or(right_table);
-        if l_tbl == left_tbl_simple && r_tbl == right_tbl_simple {
-            Some((l_col, r_col))
-        } else if l_tbl == right_tbl_simple && r_tbl == left_tbl_simple {
-            Some((r_col, l_col))
-        } else if l_tbl.is_empty() && r_tbl.is_empty() {
+        let left_in_tables = |t: &str| {
+            left_tables.iter().any(|lt| lt.split('.').last().unwrap_or(lt) == t)
+        };
+        let right_in_right = r_tbl == right_tbl_simple || r_tbl.is_empty();
+        let left_in_left = l_tbl.is_empty() || left_in_tables(&l_tbl);
+        let right_in_left = r_tbl.is_empty() || left_in_tables(&r_tbl);
+
+        if left_in_left && right_in_right && !right_in_left {
+            let left_col = if l_tbl.is_empty() && left_tables.len() == 1 {
+                l_col
+            } else if !l_tbl.is_empty() && left_tables.len() > 1 {
+                format!("{}.{}", l_tbl, l_col)
+            } else {
+                format!("{}.{}", left_tables[0], l_col)
+            };
+            Some((left_col, r_col))
+        } else if right_in_left && l_tbl == right_tbl_simple {
+            let left_col = if r_tbl.is_empty() && left_tables.len() == 1 {
+                r_col
+            } else if !r_tbl.is_empty() && left_tables.len() > 1 {
+                format!("{}.{}", r_tbl, r_col)
+            } else {
+                format!("{}.{}", left_tables[0], r_col)
+            };
+            Some((left_col, l_col))
+        } else if l_tbl.is_empty() && r_tbl.is_empty() && left_tables.len() == 1 {
             Some((l_col, r_col))
         } else {
             None

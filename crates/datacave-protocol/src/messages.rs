@@ -139,6 +139,8 @@ pub enum BackendMessage {
     ParseComplete,
     BindComplete,
     NoData,
+    /// ParameterDescription (t) – parameter OIDs for prepared statement.
+    ParameterDescription { param_oids: Vec<i32> },
     RowDescription { fields: Vec<RowDescriptionField> },
     DataRow { values: Vec<Option<Vec<u8>>> },
     CommandComplete { tag: String },
